@@ -159,31 +159,10 @@ def test_global_model(parameters: Parameters, data_dir: str = "mimic-iv-3.1") ->
         import traceback
         traceback.print_exc()
 
-class CustomFedAvg(FedAvg):
-    def __init__(self, *args, **kwargs):
-        self.total_rounds = kwargs.pop("total_rounds", 1)
-        self.data_dir = kwargs.pop("data_dir", "mimic-iv-3.1")
-        super().__init__(*args, **kwargs)
-        self.current_round = 0
-    
-    def aggregate_fit(
-        self,
-        server_round: int,
-        results: List[Tuple[ClientProxy, FitRes]],
-        failures: List[Tuple[ClientProxy, FitRes] | Tuple[ClientProxy, Exception]],
-    ) -> Tuple[Optional[Parameters], Dict[str, any]]:
-        """Aggregate fit results and test global model on final round."""
-        
-        aggregated_result = super().aggregate_fit(server_round, results, failures)
-        
-        if server_round == self.total_rounds and aggregated_result[0] is not None:
-            print(f"\nFINAL ROUND ({server_round}) - TESTING GLOBAL AGGREGATED MODEL")
-            test_global_model(aggregated_result[0], self.data_dir)
-        
-        return aggregated_result
+# Using standard FedAvg strategy - no custom implementation needed
 
 def get_strategy(run_config):
-    """Create FedAvg strategy with custom aggregation functions."""
+    """Create standard FedAvg strategy with aggregation functions."""
     def evaluate_metrics_aggregation_fn(eval_metrics):
         try:
             print(f"Evaluate metrics aggregation called with {len(eval_metrics)} results")
@@ -200,7 +179,7 @@ def get_strategy(run_config):
             print(f"Error in fit_metrics_aggregation_fn: {e}")
             return {}
     
-    return CustomFedAvg(
+    return FedAvg(
         evaluate_metrics_aggregation_fn=evaluate_metrics_aggregation_fn,
         fit_metrics_aggregation_fn=fit_metrics_aggregation_fn,
         min_available_clients=run_config.get("num-partitions", 2),
@@ -208,7 +187,4 @@ def get_strategy(run_config):
         fraction_evaluate=1.0,
         min_fit_clients=run_config.get("num-partitions", 2),
         min_evaluate_clients=run_config.get("num-partitions", 2),
-        accept_failures=True,
-        total_rounds=run_config.get("num-server-rounds", 1),
-        data_dir=run_config.get("data-dir", "mimic-iv-3.1"),
     ) 
