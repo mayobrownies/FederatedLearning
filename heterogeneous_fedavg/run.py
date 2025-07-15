@@ -4,7 +4,6 @@ import warnings
 import logging
 import time
 
-# Add the project root to the Python path to enable absolute imports
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
@@ -20,27 +19,22 @@ from heterogeneous_fedavg.client import get_client
 from heterogeneous_fedavg.server import get_strategy
 from heterogeneous_fedavg.task import load_and_partition_data, ALL_CHAPTERS, TOP_K_CODES, TOP_ICD_CODES, create_features_and_labels, get_global_feature_space
 
-# Suppress warnings and reduce Ray logging
 warnings.filterwarnings("ignore", category=UserWarning)
 logging.getLogger("ray").setLevel(logging.WARNING)
 logging.getLogger("flwr").setLevel(logging.WARNING)
 
-""" To change the number of ICD codes to predict, modify the number for TOP_K_CODES in the task.py file """
-
-# Simulation parameters
-MIMIC_DATA_DIR = "mimic-iv-3.1"
-MIN_PARTITION_SIZE = 1000  # Number of samples per chapter; will affect the number of clients
-
 # Model and training configuration
-NUM_ROUNDS = 15
+MIMIC_DATA_DIR = "mimic-iv-3.1"
+MIN_PARTITION_SIZE = 1000
+
+NUM_ROUNDS = 1
 LOCAL_EPOCHS = 3
 BATCH_SIZE = 64
 LEARNING_RATE = 0.0002
-PROXIMAL_MU = 0  # Set > 0 for fedprox; = 0 for fedavg
+# No proximal regularization in FedAvg
 
-# Advanced training options
 USE_ADVANCED_MODEL = True
-USE_FOCAL_LOSS = True
+USE_FOCAL_LOSS = False
 HIDDEN_DIMS = [512, 256, 128]
 DROPOUT_RATE = 0.3
 
@@ -51,7 +45,7 @@ VALID_PARTITIONS = load_and_partition_data(data_dir=MIMIC_DATA_DIR, min_partitio
 NUM_CLIENTS = len(VALID_PARTITIONS)
 
 def analyze_class_distribution():
-    """Analyze the class distribution across all clients to identify the root cause of the issue"""
+    """Analyze class distribution across all clients."""
     print("\n" + "="*80)
     print("ANALYZING CLASS DISTRIBUTION ACROSS CLIENTS")
     print("="*80)
@@ -67,12 +61,10 @@ def analyze_class_distribution():
         print(f"\nClient {client_id} - Chapter '{chapter_name}':")
         print(f"  Total samples: {len(chapter_data)}")
         
-        # Get labels for this client
         _, labels = create_features_and_labels(
             chapter_data, chapter_name, global_feature_space, include_icd_features=True
         )
         
-        # Count class distribution
         unique_labels, counts = np.unique(labels, return_counts=True)
         
         top_k_count = sum(counts[unique_labels < len(TOP_ICD_CODES)])
@@ -107,7 +99,6 @@ def analyze_class_distribution():
     print(f"Total top-K samples: {total_top_k_samples} ({total_top_k_samples/total_samples*100:.1f}%)")
     print(f"Total 'other' samples: {total_other_samples} ({total_other_samples/total_samples*100:.1f}%)")
     
-    # Find problematic clients
     problematic_clients = [s for s in client_stats if s['top_k_ratio'] < 0.1]
     print(f"\nProblematic clients (< 10% top-K samples): {len(problematic_clients)}")
     
@@ -141,7 +132,7 @@ def analyze_class_distribution():
     return client_stats
 
 def filter_quality_clients(partitions, min_top_k_ratio=0.20):
-    """Remove clients with poor data quality for better federated learning"""
+    """Remove clients with poor data quality."""
     print(f"\nFiltering clients with <{min_top_k_ratio*100:.0f}% top-K samples...")
     
     global_feature_space = get_global_feature_space(MIMIC_DATA_DIR)
@@ -163,15 +154,25 @@ def filter_quality_clients(partitions, min_top_k_ratio=0.20):
     print(f"\nFiltered {filtered_count} clients, kept {len(quality_partitions)} quality clients")
     return quality_partitions
 
-# Starts the FedAvg federated learning simulation for MIMIC-IV
 def main():
-    # First, analyze the class distribution to identify issues
+    """Start the heterogeneous FedAvg federated learning simulation."""
     client_stats = analyze_class_distribution()
     
-    # Filter out clients with poor data quality (same threshold as partitioning)
     global VALID_PARTITIONS, NUM_CLIENTS
-    VALID_PARTITIONS = filter_quality_clients(VALID_PARTITIONS, min_top_k_ratio=0.20)
+    # For heterogeneous FL, apply minimal filtering to avoid crashes
+    # Filter only chapters that could cause Ray worker crashes (very small datasets)
+    print(f"\nApplying minimal safety filtering for heterogeneous FL...")
+    safe_partitions = {}
+    for name, data in VALID_PARTITIONS.items():
+        if len(data) >= 500:  # Much lower threshold than hybrid (1000), just for safety
+            safe_partitions[name] = data
+            print(f"  ✓ Keeping chapter '{name}': {len(data)} samples")
+        else:
+            print(f"  ✗ Filtering chapter '{name}': {len(data)} samples (too small, may cause crashes)")
+    
+    VALID_PARTITIONS = safe_partitions
     NUM_CLIENTS = len(VALID_PARTITIONS)
+    print(f"Using {NUM_CLIENTS} safe chapter-based partitions for heterogeneous FL")
     
     print(f"\n" + "="*80)
     print("SIMULATION CONFIGURATION")
@@ -183,12 +184,10 @@ def main():
         "local-epochs": LOCAL_EPOCHS,
         "batch-size": BATCH_SIZE,
         "learning-rate": LEARNING_RATE,
-        "proximal-mu": PROXIMAL_MU,
         "data-dir": MIMIC_DATA_DIR,
         "min-partition-size": MIN_PARTITION_SIZE,
     }
 
-    # Creates a Flower client representing a single medical partition
     def client_fn(context: Context) -> fl.client.Client:
         partition_id = hash(context.node_id) % NUM_CLIENTS
         return get_client(run_config=run_config, partition_id=partition_id).to_client()
@@ -197,29 +196,26 @@ def main():
 
     print(f"Starting FedAvg simulation with {NUM_CLIENTS} clients for {NUM_ROUNDS} rounds...")
     print(f"Available chapters: {list(VALID_PARTITIONS.keys())}")
-    print(f"Configuration: lr={LEARNING_RATE}, mu={PROXIMAL_MU}, local_epochs={LOCAL_EPOCHS}")
+    print(f"Configuration: lr={LEARNING_RATE} (FedAvg - no proximal regularization), local_epochs={LOCAL_EPOCHS}")
     print(f"Total ICD codes in model: {len(TOP_ICD_CODES)}")
     
-    # Shutdown any existing Ray instance to avoid conflicts
     try:
         ray.shutdown()
         print("Existing Ray instance shut down successfully")
     except Exception as e:
         print(f"No existing Ray instance to shut down: {e}")
     
-    # Configure Ray with more robust parameters
     ray_init_args = {
         "ignore_reinit_error": True,
         "log_to_driver": False,
         "include_dashboard": False,
-        "num_cpus": None,  # Use all available CPUs
-        "object_store_memory": None,  # Use default memory allocation
-        "_temp_dir": None,  # Use default temp directory
-        "local_mode": False,  # Use cluster mode for better stability
+        "num_cpus": None,
+        "object_store_memory": 1000000000,  # 1GB object store
+        "_temp_dir": None,
+        "local_mode": False,
     }
     
-    # Reduce client resources to avoid oversubscription
-    client_resources = {"num_cpus": 1}  # Reduced from 2 to 1
+    client_resources = {"num_cpus": 1, "memory": 2000000000}  # 2GB per client
     
     history = fl.simulation.start_simulation(
         client_fn=client_fn,
@@ -232,13 +228,12 @@ def main():
 
     print("Simulation finished.")
     
-    time.sleep(5)  # Wait for all distributed threads to finish logging
+    time.sleep(5)
     
     print("\n" + "="*80)
     print("FINAL SIMULATION RESULTS")
     print("="*80)
     
-    # Plot training loss over rounds
     train_losses_found = False
     if hasattr(history, 'metrics_distributed_fit') and history.metrics_distributed_fit:
         if "train_loss" in history.metrics_distributed_fit:
@@ -269,7 +264,6 @@ def main():
                 if attr_value:
                     print(f"  {attr}: {type(attr_value)}")
     
-    # Display final metrics with better formatting
     if hasattr(history, 'metrics_distributed') and history.metrics_distributed and "accuracy" in history.metrics_distributed:
         print("FINAL PERFORMANCE METRICS")
         print("-" * 40)
@@ -291,7 +285,6 @@ def main():
         
         print("-" * 40)
         
-        # Show training progression
         print("\nTRAINING PROGRESSION")
         print("-" * 40)
         if hasattr(history, 'metrics_distributed_fit') and history.metrics_distributed_fit and "train_loss" in history.metrics_distributed_fit:
@@ -300,14 +293,12 @@ def main():
             print(f"│ Training loss: {losses[0]:.4f} → {losses[-1]:.4f}")
             print(f"│ Loss reduction: {((losses[0] - losses[-1]) / losses[0] * 100):.1f}%")
         
-        # Accuracy progression
         accuracy_history = history.metrics_distributed.get("accuracy", [])
         if len(accuracy_history) > 1:
             accuracies = [acc for _, acc in accuracy_history]
             print(f"│ Accuracy: {accuracies[0]:.4f} → {accuracies[-1]:.4f}")
             print(f"│ Accuracy change: {((accuracies[-1] - accuracies[0]) / accuracies[0] * 100):+.1f}%")
             
-            # Check for stagnant metrics
             if all(abs(acc - accuracies[0]) < 1e-6 for acc in accuracies):
                 print("│    WARNING: Accuracy is stagnant!")
                 print("│    Model may only be predicting 'other' class")
@@ -316,7 +307,6 @@ def main():
         
         print("-" * 40)
         
-        # Final prediction analysis
         print("\nFINAL MODEL PREDICTION DISTRIBUTION")
         print("-" * 40)
         print("Note: Detailed prediction analysis should appear above during final round.")
@@ -327,7 +317,6 @@ def main():
         
     print("\n" + "="*80)
     
-    # Clean up Ray resources
     try:
         ray.shutdown()
         print("Ray instance shut down successfully")

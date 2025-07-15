@@ -1,11 +1,3 @@
-"""
-Advanced Feature Engineering Suggestions for ICD Prediction
-==========================================================
-
-This file contains implementation ideas for additional features that could
-significantly improve ICD prediction accuracy.
-"""
-
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import PolynomialFeatures

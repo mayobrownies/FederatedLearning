@@ -26,6 +26,9 @@ def main():
     print(f"Data directory: {args.data_dir}")
     print(f"Force recompute: {args.force_recompute}")
     print()
+    print("NOTE: Diagnoses and procedures are excluded from training data")
+    print("      to prevent data leakage in ICD code prediction task.")
+    print()
     
     # Check if data directory exists
     if not os.path.exists(args.data_dir):
@@ -33,15 +36,15 @@ def main():
         print("Please ensure you have the MIMIC-IV data extracted in the correct location.")
         sys.exit(1)
     
-    # Check for key files
+    # Check for key files (excluding diagnoses and procedures to prevent data leakage)
     required_files = [
         'hosp/admissions.csv.gz',
-        'hosp/diagnoses_icd.csv.gz',
         'hosp/patients.csv.gz',
         'hosp/prescriptions.csv.gz',
-        'hosp/procedures_icd.csv.gz',
         'hosp/drgcodes.csv.gz',
         'hosp/services.csv.gz'
+        # NOTE: Removed diagnoses_icd.csv.gz and procedures_icd.csv.gz
+        # These contain ICD codes that would leak information for ICD prediction task
     ]
     
     missing_files = []
@@ -54,6 +57,9 @@ def main():
         for file in missing_files:
             print(f"   - {file}")
         print("Please ensure you have all MIMIC-IV files extracted.")
+        print()
+        print("NOTE: diagnoses_icd.csv.gz and procedures_icd.csv.gz are not required")
+        print("      as they are excluded to prevent data leakage in ICD prediction.")
         sys.exit(1)
     
     print("All required files found")
@@ -65,6 +71,15 @@ def main():
         
         print("Starting medical feature preprocessing...")
         print("This may take several minutes on the first run...")
+        print()
+        print("Features being processed:")
+        print("  ✓ Lab values (clinical indicators)")
+        print("  ✓ Medications (drug categories and interactions)")
+        print("  ✓ ICU monitoring (vital signs, interventions)")
+        print("  ✓ Microbiology (infection markers)")
+        print("  ✓ Severity indicators (DRG codes, services)")
+        print("  ✗ Diagnoses (excluded - would leak ICD information)")
+        print("  ✗ Procedures (excluded - would leak ICD information)")
         print()
         
         results = preprocess_all_medical_features(
@@ -91,8 +106,16 @@ def main():
         
         print(f"Total medical features: {total_features}")
         print()
-        print("You can now run the federated learning simulation with fast medical feature access!")
-        print("   python heterogeneous_mimic/run.py")
+        print("Data leakage prevention measures:")
+        print("  - Primary diagnoses excluded (would reveal target ICD codes)")
+        print("  - Secondary diagnoses excluded (would reveal related ICD codes)")
+        print("  - Procedures excluded (contain ICD procedure codes)")
+        print("  - Only clinical indicators and administrative data included")
+        print()
+        print("You can now run the federated learning simulation with clean medical features!")
+        print("   python heterogeneous_fedavg/run.py")
+        print("   python heterogeneous_fedprox/run.py")
+        print("   python hybrid_fedprox/run.py")
         print()
         
     except KeyboardInterrupt:

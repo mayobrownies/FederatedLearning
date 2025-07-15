@@ -31,7 +31,7 @@ NUM_ROUNDS = 20
 LOCAL_EPOCHS = 3
 BATCH_SIZE = 64
 LEARNING_RATE = 0.0002
-PROXIMAL_MU = 0 # Set > 0 for fedprox; = 0 for fedavg
+PROXIMAL_MU = 0.1 # Set > 0 for fedprox; = 0 for fedavg
 
 USE_ADVANCED_MODEL = True
 USE_FOCAL_LOSS = False
@@ -183,9 +183,9 @@ def main():
 
     strategy = get_strategy(run_config)
 
-    print(f"Starting FedProx simulation with {NUM_CLIENTS} clients for {NUM_ROUNDS} rounds...")
+    print(f"Starting Hybrid FedProx simulation with {NUM_CLIENTS} clients for {NUM_ROUNDS} rounds...")
     print(f"Available chapters: {list(VALID_PARTITIONS.keys())}")
-    print(f"Configuration: lr={LEARNING_RATE}, mu={PROXIMAL_MU}, local_epochs={LOCAL_EPOCHS}")
+    print(f"Configuration: lr={LEARNING_RATE}, mu={PROXIMAL_MU} (Hybrid FedProx), local_epochs={LOCAL_EPOCHS}")
     print(f"Total ICD codes in model: {len(TOP_ICD_CODES)}")
     
     try:
@@ -231,7 +231,7 @@ def main():
             losses = [loss for _, loss in train_losses]
             
             plt.figure(figsize=(10, 6))
-            plt.plot(rounds, losses, 'b-', linewidth=2, marker='o', label='FedProx Training Loss')
+            plt.plot(rounds, losses, 'b-', linewidth=2, marker='o', label='Hybrid FedProx Training Loss')
             plt.xlabel('Communication Rounds', fontsize=12)
             plt.ylabel('Training Loss', fontsize=12)
             plt.title('Training Loss vs Communication Rounds (MIMIC-IV)', fontsize=14)

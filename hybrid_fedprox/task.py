@@ -194,7 +194,7 @@ def get_chapter_from_icd9(icd_code: str) -> str:
         except (ValueError, IndexError): 
             return "unknown"
     if icd_code.startswith('V'): 
-        return "v_codes"
+        return "health_factors"  # ICD-9 V codes = health factors (same as ICD-10 Z codes)
     try:
         code_num = int(float(icd_code))
         for chapter, (start, end) in ICD9_CHAPTERS.items():

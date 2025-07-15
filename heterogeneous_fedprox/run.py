@@ -23,17 +23,18 @@ warnings.filterwarnings("ignore", category=UserWarning)
 logging.getLogger("ray").setLevel(logging.WARNING)
 logging.getLogger("flwr").setLevel(logging.WARNING)
 
+# Model and training configuration
 MIMIC_DATA_DIR = "mimic-iv-3.1"
 MIN_PARTITION_SIZE = 1000
 
-NUM_ROUNDS = 15
+NUM_ROUNDS = 20
 LOCAL_EPOCHS = 3
 BATCH_SIZE = 64
 LEARNING_RATE = 0.0002
-PROXIMAL_MU = 1.0
+PROXIMAL_MU = 0.1 # Set > 0 for fedprox; = 0 for fedavg
 
 USE_ADVANCED_MODEL = True
-USE_FOCAL_LOSS = True
+USE_FOCAL_LOSS = False
 HIDDEN_DIMS = [512, 256, 128]
 DROPOUT_RATE = 0.3
 
@@ -154,12 +155,24 @@ def filter_quality_clients(partitions, min_top_k_ratio=0.20):
     return quality_partitions
 
 def main():
-    """Start the FedProx federated learning simulation."""
+    """Start the heterogeneous FedProx federated learning simulation."""
     client_stats = analyze_class_distribution()
     
     global VALID_PARTITIONS, NUM_CLIENTS
-    VALID_PARTITIONS = filter_quality_clients(VALID_PARTITIONS, min_top_k_ratio=0.20)
+    # For heterogeneous FL, apply minimal filtering to avoid crashes
+    # Filter only chapters that could cause Ray worker crashes (very small datasets)
+    print(f"\nApplying minimal safety filtering for heterogeneous FL...")
+    safe_partitions = {}
+    for name, data in VALID_PARTITIONS.items():
+        if len(data) >= 500:  # Much lower threshold than hybrid (1000), just for safety
+            safe_partitions[name] = data
+            print(f"  ✓ Keeping chapter '{name}': {len(data)} samples")
+        else:
+            print(f"  ✗ Filtering chapter '{name}': {len(data)} samples (too small, may cause crashes)")
+    
+    VALID_PARTITIONS = safe_partitions
     NUM_CLIENTS = len(VALID_PARTITIONS)
+    print(f"Using {NUM_CLIENTS} safe chapter-based partitions for heterogeneous FL")
     
     print(f"\n" + "="*80)
     print("SIMULATION CONFIGURATION")
@@ -184,7 +197,7 @@ def main():
 
     print(f"Starting FedProx simulation with {NUM_CLIENTS} clients for {NUM_ROUNDS} rounds...")
     print(f"Available chapters: {list(VALID_PARTITIONS.keys())}")
-    print(f"Configuration: lr={LEARNING_RATE}, mu={PROXIMAL_MU}, local_epochs={LOCAL_EPOCHS}")
+    print(f"Configuration: lr={LEARNING_RATE}, mu={PROXIMAL_MU} (FedProx - with proximal term), local_epochs={LOCAL_EPOCHS}")
     print(f"Total ICD codes in model: {len(TOP_ICD_CODES)}")
     
     try:
@@ -198,12 +211,12 @@ def main():
         "log_to_driver": False,
         "include_dashboard": False,
         "num_cpus": None,
-        "object_store_memory": None,
+        "object_store_memory": 1000000000,  # 1GB object store
         "_temp_dir": None,
         "local_mode": False,
     }
     
-    client_resources = {"num_cpus": 1}
+    client_resources = {"num_cpus": 1, "memory": 2000000000}  # 2GB per client
     
     history = fl.simulation.start_simulation(
         client_fn=client_fn,

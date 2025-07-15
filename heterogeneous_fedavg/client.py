@@ -38,7 +38,7 @@ class FlowerClient(fl.client.NumPyClient):
             trainloader=self.trainloader,
             epochs=self.run_config["local-epochs"],
             learning_rate=self.run_config["learning-rate"],
-            proximal_mu=self.run_config["proximal-mu"],
+            proximal_mu=0.0,  # FedAvg doesn't use proximal regularization
             device=self.device
         )
         
