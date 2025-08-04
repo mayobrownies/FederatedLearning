@@ -55,7 +55,7 @@ CHAPTER_TO_INDEX = {chapter: idx for idx, chapter in enumerate(ALL_CHAPTERS)}
 INDEX_TO_CHAPTER = {idx: chapter for chapter, idx in CHAPTER_TO_INDEX.items()}
 
 # Configuration for ICD code prediction
-TOP_K_CODES = 50
+TOP_K_CODES = 75
 TOP_ICD_CODES = []
 ICD_CODE_TO_INDEX = {}
 INDEX_TO_ICD_CODE = {}

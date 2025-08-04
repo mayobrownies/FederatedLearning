@@ -1,0 +1,34 @@
+Project Overview and Goals
+Project Title: Advanced Federated Learning for Heterogeneous Medical Data
+
+1. The Problem: Data Silos and Statistical Heterogeneity in Healthcare
+
+In healthcare, patient data is often siloed within different hospital departments or institutions, making it impossible to train a single, comprehensive AI model without compromising patient privacy. This project tackles a more complex version of this problem: extreme statistical heterogeneity.
+
+Using the MIMIC-IV dataset, we partition medical data by ICD chapter, simulating a network of "specialist" clients (e.g., an ophthalmology department) and "generalist" clients (e.g., an internal medicine department). This creates a realistic scenario where:
+
+Generalist clients have large volumes of data on common conditions (e.g., hypertension, respiratory infections).
+
+Specialist clients have smaller, but highly valuable, datasets on rare or specific conditions (e.g., congenital defects, rare blood disorders).
+
+In a standard federated learning system, the massive amount of data from generalists would overwhelm and dilute the crucial, nuanced knowledge from the specialists.
+
+2. Primary Goal: Preserve Specialist Knowledge with the "Specialist Council"
+
+Our primary objective is to design and implement a novel hybrid federated learning architecture, the "Specialist Council," that can effectively learn from this diverse network. This architecture aims to:
+
+Protect Specialist Expertise: By training dedicated "expert" models on specialist data, we prevent their unique knowledge from being lost.
+
+Leverage Generalist Knowledge: A lightweight, efficient "generalist" model is trained on high-frequency data to handle common cases quickly.
+
+Create an Intelligent, Efficient System: An intelligent routing mechanism uses the generalist model's prediction confidence to decide whether to provide an immediate answer or consult the "council" of experts for a more nuanced prediction.
+
+3. Long-Term Goal: Explore Unified Models for True Heterogeneity
+
+Looking beyond the initial hybrid model, this project also aims to investigate more advanced federated techniques capable of creating a single, unified global model from architecturally diverse clients (e.g., some using CNNs, others LSTMs).
+
+As outlined in our research slides, we will explore methods like Unified Latent Consensus Distillation (ULCD), where clients share compressed "latent summaries" of their knowledge rather than model weights. The goal is to develop a highly communication-efficient and privacy-preserving system that can learn a generalized structure from fundamentally different client models.
+
+4. Immediate Objective: Establish a Performance Baseline
+
+Our immediate next step is to train models in isolation on each client's siloed data. This will establish a crucial performance baseline, allowing us to quantify the poor generalization of non-collaborative models and definitively measure the improvements gained from our proposed federated architectures.

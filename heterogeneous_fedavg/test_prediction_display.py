@@ -25,7 +25,7 @@ def test_prediction_display():
     task_module.TOP_ICD_CODES.extend(mock_top_icd_codes)
     
     try:
-        total_samples = 1000
+        total_samples = 10000
         
         all_predictions = []
         all_labels = []
