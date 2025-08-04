@@ -4,7 +4,6 @@ import numpy as np
 def plot_federated_learning_heterogeneity():
     """Plot federated learning client heterogeneity using the exact numbers provided"""
     
-    # Data from the user's federated learning output - ALL chapters including skipped ones
     chapters = [
         'mental', 'infectious_parasitic', 'health_factors', 'respiratory',
         'symptoms_ill_defined', 'circulatory', 'genitourinary', 'nervous',
@@ -13,8 +12,7 @@ def plot_federated_learning_heterogeneity():
         'blood', 'congenital', 'ear', 'external_causes', 'eye', 'perinatal'
     ]
     
-    # Exact percentages from federated learning output (sorted by percentage)
-    # Note: Skipped chapters percentages are estimated - you may want to provide actual values
+
     percentages = [
         65.96, 58.93, 56.70, 53.10, 50.99, 49.44, 44.68, 31.03,
         32.52, 20.01, 14.70, 13.81, 12.31, 12.92, 11.94, 3.96, 0.00,
