@@ -5,6 +5,7 @@ import numpy as np
 # HETEROGENEITY VISUALIZATION
 # ============================================================================
 def plot_federated_learning_heterogeneity():
+    
     chapters = [
         'mental', 'infectious_parasitic', 'health_factors', 'symptoms_ill_defined', 
         'circulatory', 'genitourinary', 'respiratory', 'endocrine_metabolic', 
@@ -12,7 +13,7 @@ def plot_federated_learning_heterogeneity():
         'pregnancy_childbirth', 'injury_poisoning', 'neoplasms', 'blood',
         'congenital', 'ear', 'external_causes', 'eye', 'perinatal'
     ]
-    
+
     percentages = [
         65.96, 62.55, 60.65, 56.86, 56.07, 53.99, 53.10, 35.55,
         34.88, 32.52, 24.77, 18.56, 17.33, 11.94, 12.31, 3.96, 0.00,
