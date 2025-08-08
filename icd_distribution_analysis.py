@@ -7,11 +7,12 @@ from collections import Counter
 import warnings
 warnings.filterwarnings('ignore')
 
-# Set style for better looking plots
 plt.style.use('seaborn-v0_8')
 sns.set_palette("husl")
 
-# ICD Chapter mappings for data partitioning (from heterogeneous_fedavg/task.py)
+# ============================================================================
+# ICD CODE MAPPINGS
+# ============================================================================
 ICD9_CHAPTERS = {
     "infectious_parasitic": (1, 139), "neoplasms": (140, 239),
     "endocrine_metabolic": (240, 279), "blood": (280, 289),
@@ -36,16 +37,11 @@ ICD10_CHAPTERS = {
     "external_causes": ("V00", "Y99"), "health_factors": ("Z00", "Z99"),
 }
 
+# ============================================================================
+# DISTRIBUTION ANALYZER
+# ============================================================================
 class ICDDistributionAnalyzer:
     def __init__(self, diagnoses_file, icd_dict_file, k=75):
-        """
-        Initialize the analyzer with file paths
-        
-        Args:
-            diagnoses_file: Path to diagnoses_icd.csv.gz
-            icd_dict_file: Path to d_icd_diagnoses.csv.gz
-            k: Number of top ICD codes to analyze
-        """
         self.diagnoses_file = diagnoses_file
         self.icd_dict_file = icd_dict_file
         self.k = k
@@ -53,7 +49,6 @@ class ICDDistributionAnalyzer:
         self.icd_dict_df = None
         
     def load_data(self):
-        """Load the diagnoses and ICD dictionary data"""
         print("Loading diagnoses data...")
         self.diagnoses_df = pd.read_csv(self.diagnoses_file, compression='gzip')
         print(f"Loaded {len(self.diagnoses_df)} diagnosis records")
@@ -62,7 +57,6 @@ class ICDDistributionAnalyzer:
         self.icd_dict_df = pd.read_csv(self.icd_dict_file, compression='gzip')
         print(f"Loaded {len(self.icd_dict_df)} ICD codes")
         
-        # Merge diagnoses with dictionary to get descriptions
         self.diagnoses_df = self.diagnoses_df.merge(
             self.icd_dict_df[['icd_code', 'long_title']], 
             on='icd_code', 
@@ -70,7 +64,6 @@ class ICDDistributionAnalyzer:
         )
         
     def get_diagnosis_chapter(self, row):
-        """Determine diagnosis chapter based on ICD version"""
         version = row['icd_version']
         code = str(row['icd_code'])
         
@@ -81,7 +74,6 @@ class ICDDistributionAnalyzer:
         return "unknown"
     
     def get_chapter_from_icd10(self, icd_code):
-        """Maps ICD-10 code to its major diagnostic chapter"""
         if not isinstance(icd_code, str) or len(icd_code) < 3:
             return "unknown"
         code_prefix = icd_code[:3].upper()
@@ -91,7 +83,6 @@ class ICDDistributionAnalyzer:
         return "unknown"
     
     def get_chapter_from_icd9(self, icd_code):
-        """Maps ICD-9 code to its major diagnostic chapter"""
         if icd_code.startswith('E'):
             try:
                 code_num = int(icd_code[1:4])
@@ -111,15 +102,6 @@ class ICDDistributionAnalyzer:
         return "unknown"
     
     def get_icd_distribution(self, top_k_values=None):
-        """
-        Calculate distribution statistics for different top K values
-        
-        Args:
-            top_k_values: List of K values to analyze (defaults to [10, 20, 50, 100, 200, 500])
-            
-        Returns:
-            Dictionary with distribution statistics
-        """
         if self.diagnoses_df is None:
             raise ValueError("Data not loaded. Call load_data() first.")
         
@@ -384,7 +366,7 @@ def main():
     diagnoses_file = "mimic-iv-3.1/hosp/diagnoses_icd.csv.gz"
     icd_dict_file = "mimic-iv-3.1/hosp/d_icd_diagnoses.csv.gz"
     
-    k = 75  # Change this value to analyze different numbers of top ICD codes
+    k = 100  # Change this value to analyze different numbers of top ICD codes
     
     # Initialize analyzer
     analyzer = ICDDistributionAnalyzer(diagnoses_file, icd_dict_file, k=k)
@@ -395,8 +377,7 @@ def main():
         
         # Analyze distribution for different K values
         print(f"\nAnalyzing ICD code distributions (K={k})...")
-        k_values = [10, 20, 50, 100, 200, 500, k]
-        k_values.sort()
+        k_values = [10, 20, 50, 100, 200, 500]
         results = analyzer.get_icd_distribution(k_values)
         
         # Analyze heterogeneous distribution

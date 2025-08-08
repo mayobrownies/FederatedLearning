@@ -18,7 +18,7 @@ class FlowerClient(fl.client.NumPyClient):
             min_partition_size=run_config["min-partition-size"]
         )
         
-        self.net = get_model(input_dim, output_dim=output_dim)
+        self.net = get_model(run_config["model_name"], input_dim, output_dim=output_dim)
         
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 

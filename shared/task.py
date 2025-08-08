@@ -17,7 +17,9 @@ from torch.utils.data import DataLoader, Dataset
 from flwr.common import parameters_to_ndarrays
 from torch.nn import functional as F
 
-# ICD Chapter mappings for data partitioning
+# ============================================================================
+# ICD CODE MAPPINGS
+# ============================================================================
 ICD9_CHAPTERS = {
     "infectious_parasitic": (1, 139), "neoplasms": (140, 239),
     "endocrine_metabolic": (240, 279), "blood": (280, 289),
@@ -42,7 +44,6 @@ ICD10_CHAPTERS = {
     "external_causes": ("V00", "Y99"), "health_factors": ("Z00", "Z99"),
 }
 
-# Global chapter mapping for multi-class classification
 ALL_CHAPTERS = [
     "infectious_parasitic", "neoplasms", "blood", "endocrine_metabolic", 
     "mental", "nervous", "eye", "ear", "circulatory", "respiratory", 
@@ -54,13 +55,14 @@ ALL_CHAPTERS = [
 CHAPTER_TO_INDEX = {chapter: idx for idx, chapter in enumerate(ALL_CHAPTERS)}
 INDEX_TO_CHAPTER = {idx: chapter for chapter, idx in CHAPTER_TO_INDEX.items()}
 
-# Configuration for ICD code prediction
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
 TOP_K_CODES = 100
 TOP_ICD_CODES = []
 ICD_CODE_TO_INDEX = {}
 INDEX_TO_ICD_CODE = {}
 
-# Function to set the number of top ICD codes to predict
 def set_top_k_codes(k: int):
     global TOP_K_CODES, TOP_ICD_CODES, ICD_CODE_TO_INDEX, INDEX_TO_ICD_CODE
     TOP_K_CODES = k
@@ -70,43 +72,72 @@ def set_top_k_codes(k: int):
     INDEX_TO_ICD_CODE.clear()
     print(f"Set TOP_K_CODES to {k}. Mappings will be recomputed on next data load.")
 
-# Feature cache setup
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 FEATURE_CACHE_DIR = os.path.join(project_root, "feature_cache")
 
-# Heterogeneous partitioning strategy - one client per chapter for true data heterogeneity
+# ============================================================================
+# PARTITIONING STRATEGIES
+# ============================================================================
 def create_heterogeneous_partitions(data: pd.DataFrame, min_partition_size: int = 1000) -> Dict[str, pd.DataFrame]:
-    """
-    Create heterogeneous partitions where each client gets exactly one medical chapter.
-    This creates true data heterogeneity since each client specializes in one medical domain.
-    """
     print("Creating heterogeneous partitions (one chapter per client)...")
     
-    # First, identify which ICD codes are in the top K for reporting
     icd_counts = data['icd_code'].value_counts()
     top_codes = set(icd_counts.head(TOP_K_CODES).index.tolist())
     
-    # Add a flag for whether each sample has a top-K code
     data['has_top_k_code'] = data['icd_code'].isin(top_codes)
     
-    # Group by chapter
     chapter_groups = data.groupby('diagnosis_chapter')
     
     partitions = {}
     
-    # Create one partition per chapter (if it meets minimum size)
     for chapter, chapter_data in chapter_groups:
         top_k_count = chapter_data['has_top_k_code'].sum()
         top_k_ratio = top_k_count / len(chapter_data)
         
         if len(chapter_data) >= min_partition_size:
-            # Use this chapter as a separate client
             partitions[f"{chapter}"] = chapter_data
             print(f"Chapter client '{chapter}': {len(chapter_data)} samples, {top_k_ratio:.2%} top-K")
         else:
             print(f"Skipping chapter '{chapter}': only {len(chapter_data)} samples (< {min_partition_size})")
     
     print(f"Created {len(partitions)} heterogeneous partitions (one per chapter)")
+    return partitions
+
+def create_balanced_partitions(data: pd.DataFrame, min_partition_size: int = 1000, top_k_codes: int = 75) -> Dict[str, pd.DataFrame]:
+    print("Creating balanced partitions...")
+    
+    icd_counts = data['icd_code'].value_counts()
+    top_codes = set(icd_counts.head(top_k_codes).index.tolist())
+    
+    data['has_top_k_code'] = data['icd_code'].isin(top_codes)
+    
+    # Calculate number of partitions based on data size
+    total_samples = len(data)
+    num_partitions = max(2, total_samples // min_partition_size)
+    
+    # Shuffle data to ensure random distribution
+    data_shuffled = data.sample(frac=1, random_state=42).reset_index(drop=True)
+    
+    partitions = {}
+    partition_size = total_samples // num_partitions
+    
+    for i in range(num_partitions):
+        start_idx = i * partition_size
+        end_idx = start_idx + partition_size if i < num_partitions - 1 else total_samples
+        
+        partition_data = data_shuffled.iloc[start_idx:end_idx].copy()
+        
+        # Only include if it meets minimum size requirement
+        if len(partition_data) >= min_partition_size:
+            top_k_count = partition_data['has_top_k_code'].sum()
+            top_k_ratio = top_k_count / len(partition_data)
+            
+            partition_name = f"balanced_{i+1}"
+            partitions[partition_name] = partition_data
+            
+            print(f"Partition '{partition_name}': {len(partition_data)} samples, {top_k_ratio:.2%} top-K")
+    
+    print(f"Created {len(partitions)} balanced partitions")
     return partitions
 
 # Maps ICD-10 code to its major diagnostic chapter
@@ -150,7 +181,7 @@ def get_diagnosis_chapter(row: pd.Series) -> str:
     return "unknown"
 
 # Loads MIMIC-IV data and partitions by primary diagnosis chapter
-def load_and_partition_data(data_dir: str, min_partition_size: int = 1000) -> Dict[str, pd.DataFrame]:
+def load_and_partition_data(data_dir: str, min_partition_size: int = 1000, partition_scheme: str = "heterogeneous", top_k_codes: int = 75) -> Dict[str, pd.DataFrame]:
     print("Loading MIMIC-IV data...")
     try:
         admissions_path = os.path.join(data_dir, "hosp", "admissions.csv.gz")
@@ -186,10 +217,17 @@ def load_and_partition_data(data_dir: str, min_partition_size: int = 1000) -> Di
     data = data[data['diagnosis_chapter'] != 'unknown']
 
     # Initialize global ICD code mappings first
-    initialize_top_icd_codes(data)
+    initialize_top_icd_codes(data, top_k_codes)
     
-    # Use heterogeneous partitioning strategy (one client per chapter)
-    valid_partitions = create_heterogeneous_partitions(data, min_partition_size)
+    # Select partitioning scheme
+    if partition_scheme == "heterogeneous":
+        valid_partitions = create_heterogeneous_partitions(data, min_partition_size)
+    elif partition_scheme == "balanced":
+        valid_partitions = create_balanced_partitions(data, min_partition_size, top_k_codes)
+    else:
+        raise ValueError(f"Unknown partitioning scheme: {partition_scheme}")
+
+    print(f"\nFinal valid partitions: {len(valid_partitions)} created using {partition_scheme} partitioning")
     
     # Remove the has_top_k_code column we added for partitioning
     for partition_name, partition_data in valid_partitions.items():
@@ -200,10 +238,38 @@ def load_and_partition_data(data_dir: str, min_partition_size: int = 1000) -> Di
     return valid_partitions
 
 # Initializes global ICD code mappings for the top K most frequent codes
-def initialize_top_icd_codes(data: pd.DataFrame):
-    global TOP_ICD_CODES, ICD_CODE_TO_INDEX, INDEX_TO_ICD_CODE
+def initialize_top_icd_codes(data: pd.DataFrame, top_k_codes: int = 75):
+    global TOP_K_CODES, TOP_ICD_CODES, ICD_CODE_TO_INDEX, INDEX_TO_ICD_CODE
     
-    if len(TOP_ICD_CODES) > 0:  # Already initialized
+    # Handle unlimited case (all ICD codes)
+    if top_k_codes is None:
+        print("Finding ALL ICD codes (no limit)...")
+        # Count frequency of each ICD code
+        icd_counts = data['icd_code'].value_counts()
+        
+        # Use ALL codes
+        all_codes = icd_counts.index.tolist()
+        TOP_K_CODES = len(all_codes)  # Set to actual count
+        
+        # Clear existing mappings
+        TOP_ICD_CODES.clear()
+        ICD_CODE_TO_INDEX.clear()
+        INDEX_TO_ICD_CODE.clear()
+        
+        # Create mappings for all codes
+        TOP_ICD_CODES.extend(all_codes)
+        ICD_CODE_TO_INDEX.update({code: idx for idx, code in enumerate(all_codes)})
+        INDEX_TO_ICD_CODE.update({idx: code for idx, code in enumerate(all_codes)})
+        
+        print(f"Using ALL {len(TOP_ICD_CODES)} ICD codes")
+        print(f"Most frequent codes: {TOP_ICD_CODES[:10]}...")
+        print(f"Code frequencies: {[icd_counts[code] for code in TOP_ICD_CODES[:10]]}")
+        return
+    
+    # Handle limited TOP_K case
+    TOP_K_CODES = top_k_codes
+    
+    if len(TOP_ICD_CODES) > 0 and len(TOP_ICD_CODES) == top_k_codes:  # Already initialized with correct count
         print(f"ICD codes already initialized with {len(TOP_ICD_CODES)} codes")
         return
     
@@ -214,6 +280,11 @@ def initialize_top_icd_codes(data: pd.DataFrame):
     
     # Get top K codes
     top_codes = icd_counts.head(TOP_K_CODES).index.tolist()
+    
+    # Clear existing mappings
+    TOP_ICD_CODES.clear()
+    ICD_CODE_TO_INDEX.clear() 
+    INDEX_TO_ICD_CODE.clear()
     
     # Create mappings
     TOP_ICD_CODES.extend(top_codes)
@@ -466,10 +537,15 @@ def create_features_and_labels(df: pd.DataFrame, partition_chapter: str, global_
         return dummy_features, dummy_labels
 
 # Loads and preprocesses data for a specific partition
-def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1", min_partition_size: int = 1000):
+def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1", min_partition_size: int = 1000, partition_scheme: str = "heterogeneous", top_k_codes: int = 75, cached_partitions: Dict = None):
     try:
-        partitions = load_and_partition_data(data_dir, min_partition_size)
-        valid_partitions = {ch: df for ch, df in partitions.items() if len(df) >= 20}
+        if cached_partitions is not None:
+            # Use pre-computed partitions to avoid recomputing
+            valid_partitions = cached_partitions
+        else:
+            # Fallback to computing partitions (for backward compatibility)
+            partitions = load_and_partition_data(data_dir, min_partition_size, partition_scheme, top_k_codes)
+            valid_partitions = {ch: df for ch, df in partitions.items() if len(df) >= 20}
         
         global_feature_space = get_global_feature_space(data_dir)
         
@@ -650,7 +726,20 @@ class MimicDataset(Dataset):
         return self.features[idx], self.labels[idx]
 
 # Creates the neural network model for ICD code prediction
-def get_model(input_dim: int, hidden_dim: int = 128, output_dim: int = None, use_advanced: bool = True) -> torch.nn.Module:
+def get_model(model_name_or_input_dim, input_dim=None, hidden_dim: int = 128, output_dim: int = None, use_advanced: bool = True) -> torch.nn.Module:
+    """
+    Get model - supports both old signature get_model(input_dim, ...) and new signature get_model(model_name, input_dim, ...)
+    """
+    # Handle both signatures for backward compatibility
+    if isinstance(model_name_or_input_dim, str):
+        # New signature: get_model(model_name, input_dim, ...)
+        model_name = model_name_or_input_dim
+        actual_input_dim = input_dim
+        use_advanced = (model_name == "advanced")
+    else:
+        # Old signature: get_model(input_dim, ...)
+        actual_input_dim = model_name_or_input_dim
+        use_advanced = use_advanced  # Use the parameter as passed
     if output_dim is None:
         output_dim = len(TOP_ICD_CODES) + 1  # +1 for "other" class
     

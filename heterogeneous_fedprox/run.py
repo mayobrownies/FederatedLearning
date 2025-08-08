@@ -33,7 +33,9 @@ BATCH_SIZE = 64
 LEARNING_RATE = 0.0002
 PROXIMAL_MU = 0.1 # Set > 0 for fedprox; = 0 for fedavg
 
-USE_ADVANCED_MODEL = True
+# Choose model from the list: ["basic", "advanced"]
+AVAILABLE_MODELS = ["basic", "advanced"]
+MODEL_NAME = AVAILABLE_MODELS[1]  # Selects "advanced"
 USE_FOCAL_LOSS = False
 HIDDEN_DIMS = [512, 256, 128]
 DROPOUT_RATE = 0.3
@@ -187,6 +189,7 @@ def main():
         "proximal-mu": PROXIMAL_MU,
         "data-dir": MIMIC_DATA_DIR,
         "min-partition-size": MIN_PARTITION_SIZE,
+        "model_name": MODEL_NAME,
     }
 
     def client_fn(context: Context) -> fl.client.Client:

@@ -13,21 +13,22 @@ class FlowerClient(fl.client.NumPyClient):
         
         self.trainloader, self.testloader, input_dim, output_dim = load_data(
             partition_id=partition_id,
-            batch_size=run_config["batch-size"],
-            data_dir=run_config["data-dir"],
-            min_partition_size=run_config["min-partition-size"]
+            batch_size=run_config.get("batch_size", run_config.get("batch-size", 64)),
+            data_dir=run_config.get("data_dir", run_config.get("data-dir", "mimic-iv-3.1")),
+            min_partition_size=run_config.get("min_partition_size", run_config.get("min-partition-size", 1000)),
+            partition_scheme=run_config.get("partitioning", "heterogeneous"),
+            top_k_codes=run_config.get("top_k_codes", 75),
+            cached_partitions=run_config.get("cached_partitions")
         )
         
-        self.net = get_model(run_config["model_name"], input_dim, output_dim=output_dim)
+        self.net = get_model(run_config.get("model_name", "advanced"), input_dim, output_dim=output_dim)
         
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     def get_parameters(self, config):
-        """Return current model weights."""
         return get_weights(self.net)
 
     def fit(self, parameters, config):
-        """Train model and return updated weights."""
         set_weights(self.net, parameters)
         
         global_net = copy.deepcopy(self.net)
@@ -36,9 +37,9 @@ class FlowerClient(fl.client.NumPyClient):
             net=self.net,
             global_net=global_net,
             trainloader=self.trainloader,
-            epochs=self.run_config["local-epochs"],
-            learning_rate=self.run_config["learning-rate"],
-            proximal_mu=self.run_config["proximal-mu"],
+            epochs=self.run_config.get("local_epochs", self.run_config.get("local-epochs", 3)),
+            learning_rate=self.run_config.get("learning_rate", self.run_config.get("learning-rate", 0.0002)),
+            proximal_mu=self.run_config.get("proximal_mu", 0.0),
             device=self.device
         )
         
@@ -55,7 +56,6 @@ class FlowerClient(fl.client.NumPyClient):
         }
 
     def evaluate(self, parameters, config):
-        """Evaluate model and return metrics."""
         try:
             set_weights(self.net, parameters)
             
@@ -73,6 +73,8 @@ class FlowerClient(fl.client.NumPyClient):
                 "recall": 0.0
             }
 
+# ============================================================================
+# CLIENT FACTORY
+# ============================================================================
 def get_client(run_config: Dict, partition_id: int) -> FlowerClient:
-    """Create Flower client for given configuration and partition."""
     return FlowerClient(run_config, partition_id) 

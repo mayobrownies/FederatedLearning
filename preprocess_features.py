@@ -3,14 +3,15 @@ import sys
 import os
 import time
 
-# Add the project root to the Python path
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from hybrid_fedprox.task import preprocess_all_medical_features
 
-# Main preprocessing function
+# ============================================================================
+# PREPROCESSING PIPELINE
+# ============================================================================
 def main():
     parser = argparse.ArgumentParser(description="Preprocess medical features for MIMIC-IV federated learning")
     parser.add_argument('--force-recompute', action='store_true', 
@@ -30,21 +31,17 @@ def main():
     print("      to prevent data leakage in ICD code prediction task.")
     print()
     
-    # Check if data directory exists
     if not os.path.exists(args.data_dir):
         print(f"Error: Data directory '{args.data_dir}' not found!")
         print("Please ensure you have the MIMIC-IV data extracted in the correct location.")
         sys.exit(1)
     
-    # Check for key files (excluding diagnoses and procedures to prevent data leakage)
     required_files = [
         'hosp/admissions.csv.gz',
         'hosp/patients.csv.gz',
         'hosp/prescriptions.csv.gz',
         'hosp/drgcodes.csv.gz',
         'hosp/services.csv.gz'
-        # NOTE: Removed diagnoses_icd.csv.gz and procedures_icd.csv.gz
-        # These contain ICD codes that would leak information for ICD prediction task
     ]
     
     missing_files = []
@@ -65,7 +62,6 @@ def main():
     print("All required files found")
     print()
     
-    # Start preprocessing
     try:
         start_time = time.time()
         

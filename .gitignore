@@ -3,6 +3,8 @@ mimic-iv-3.1/
 *.csv.gz
 *.csv
 
+isolated_plots/
+
 # Feature caches (centralized)
 feature_cache/
 *.pkl

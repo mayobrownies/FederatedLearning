@@ -17,6 +17,8 @@ from torch.utils.data import DataLoader, Dataset
 from flwr.common import parameters_to_ndarrays
 from torch.nn import functional as F
 
+from models import MimicDataset, Net, FocalLoss, get_model
+
 # ICD Chapter mappings for data partitioning
 ICD9_CHAPTERS = {
     "infectious_parasitic": (1, 139), "neoplasms": (140, 239),
@@ -637,130 +639,7 @@ def create_partition_dataloaders(data, mlb, all_feature_cols, partition_id, part
     
     return trainloader, testloader, len(all_feature_cols), len(mlb.classes_)
 
-# PyTorch Dataset for MIMIC-IV data
-class MimicDataset(Dataset):
-    def __init__(self, features: np.ndarray, labels: np.ndarray):
-        self.features = torch.tensor(features, dtype=torch.float32)
-        self.labels = torch.tensor(labels, dtype=torch.long)
-    
-    def __len__(self):
-        return len(self.labels)
-    
-    def __getitem__(self, idx):
-        return self.features[idx], self.labels[idx]
 
-# Creates the neural network model for ICD code prediction
-def get_model(input_dim: int, hidden_dim: int = 128, output_dim: int = None, use_advanced: bool = True) -> torch.nn.Module:
-    if output_dim is None:
-        output_dim = len(TOP_ICD_CODES) + 1  # +1 for "other" class
-    
-    if use_advanced:
-        # Use advanced architecture with attention and residual connections
-        return AdvancedNet(input_dim, output_dim, hidden_dims=[512, 256, 128], dropout_rate=0.3)
-    else:
-        # Use simple architecture
-        return Net(input_dim, output_dim)
-
-# Neural network architecture for ICD code classification
-class Net(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(Net, self).__init__()
-        
-        # More sophisticated architecture for medical prediction
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        
-        # Feature preprocessing layers
-        self.feature_norm = nn.BatchNorm1d(input_dim)
-        
-        # Deeper network with residual connections
-        self.fc1 = nn.Linear(input_dim, 512)
-        self.bn1 = nn.BatchNorm1d(512)
-        self.fc2 = nn.Linear(512, 256)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.fc3 = nn.Linear(256, 256)
-        self.bn3 = nn.BatchNorm1d(256)
-        self.fc4 = nn.Linear(256, 128)
-        self.bn4 = nn.BatchNorm1d(128)
-        
-        # Attention mechanism for medical feature importance
-        self.attention = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 128),
-            nn.Sigmoid()
-        )
-        
-        # Final classification layers
-        self.classifier = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, output_dim)
-        )
-        
-        # Dropout layers
-        self.dropout1 = nn.Dropout(0.2)
-        self.dropout2 = nn.Dropout(0.3)
-        self.dropout3 = nn.Dropout(0.3)
-        
-    def forward(self, x):
-        # Input normalization
-        x = self.feature_norm(x)
-        
-        # Feature extraction with residual connections
-        # Block 1
-        x1 = torch.relu(self.bn1(self.fc1(x)))
-        x1 = self.dropout1(x1)
-        
-        # Block 2
-        x2 = torch.relu(self.bn2(self.fc2(x1)))
-        x2 = self.dropout2(x2)
-        
-        # Block 3 with residual connection
-        x3 = torch.relu(self.bn3(self.fc3(x2)))
-        x3 = self.dropout3(x3)
-        
-        # Block 4 with residual connection
-        x4 = torch.relu(self.bn4(self.fc4(x3 + x2)))  # Residual connection
-        
-        # Attention mechanism - learn which features are important
-        attention_weights = self.attention(x4)
-        x4_attended = x4 * attention_weights
-        
-        # Final classification
-        output = self.classifier(x4_attended)
-        
-        return output
-
-class FocalLoss(nn.Module):
-    """
-    Focal Loss for addressing class imbalance in ICD prediction.
-    Focuses training on hard examples and down-weights easy examples.
-    """
-    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-        
-    def forward(self, inputs, targets):
-        # Compute cross entropy
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-        
-        # Compute p_t
-        pt = torch.exp(-ce_loss)
-        
-        # Compute focal loss
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        else:
-            return focal_loss
 
 # Trains the model with FedProx regularization
 def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, device, use_focal_loss=False):
