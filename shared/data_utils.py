@@ -17,7 +17,9 @@ from torch.utils.data import DataLoader, Dataset
 from flwr.common import parameters_to_ndarrays
 from torch.nn import functional as F
 
-# ICD Chapter mappings for data partitioning
+# ============================================================================
+# ICD MAPPINGS
+# ============================================================================
 ICD9_CHAPTERS = {
     "infectious_parasitic": (1, 139), "neoplasms": (140, 239),
     "endocrine_metabolic": (240, 279), "blood": (280, 289),
@@ -42,7 +44,6 @@ ICD10_CHAPTERS = {
     "external_causes": ("V00", "Y99"), "health_factors": ("Z00", "Z99"),
 }
 
-# Global chapter mapping for multi-class classification
 ALL_CHAPTERS = [
     "infectious_parasitic", "neoplasms", "blood", "endocrine_metabolic", 
     "mental", "nervous", "eye", "ear", "circulatory", "respiratory", 
@@ -54,13 +55,17 @@ ALL_CHAPTERS = [
 CHAPTER_TO_INDEX = {chapter: idx for idx, chapter in enumerate(ALL_CHAPTERS)}
 INDEX_TO_CHAPTER = {idx: chapter for chapter, idx in CHAPTER_TO_INDEX.items()}
 
-# Configuration for ICD code prediction
-TOP_K_CODES = 75
+# ============================================================================
+# GLOBALS
+# ============================================================================
 TOP_ICD_CODES = []
 ICD_CODE_TO_INDEX = {}
 INDEX_TO_ICD_CODE = {}
 
-# Initializes global ICD code mappings for the top K most frequent codes
+# ============================================================================
+# FUNCTIONS
+# ============================================================================
+# Initializes ICD code mappings for top K codes
 def initialize_top_icd_codes(data: pd.DataFrame, top_k_codes: int = 75):
     global TOP_ICD_CODES, ICD_CODE_TO_INDEX, INDEX_TO_ICD_CODE
     
@@ -69,16 +74,9 @@ def initialize_top_icd_codes(data: pd.DataFrame, top_k_codes: int = 75):
         return
     
     print(f"Finding top {top_k_codes} most frequent ICD codes...")
-    global TOP_K_CODES
-    TOP_K_CODES = top_k_codes
     
-    # Count frequency of each ICD code
     icd_counts = data['icd_code'].value_counts()
-    
-    # Get top K codes
     top_codes = icd_counts.head(top_k_codes).index.tolist()
-    
-    # Create mappings
     TOP_ICD_CODES.extend(top_codes)
     ICD_CODE_TO_INDEX.update({code: idx for idx, code in enumerate(top_codes)})
     INDEX_TO_ICD_CODE.update({idx: code for idx, code in enumerate(top_codes)})
@@ -87,7 +85,7 @@ def initialize_top_icd_codes(data: pd.DataFrame, top_k_codes: int = 75):
     print(f"Most frequent codes: {TOP_ICD_CODES[:10]}...")
     print(f"Code frequencies: {[icd_counts[code] for code in TOP_ICD_CODES[:10]]}")
 
-# Maps ICD-10 code to its major diagnostic chapter
+# Maps ICD-10 code to diagnostic chapter
 def get_chapter_from_icd10(icd_code: str) -> str:
     if not isinstance(icd_code, str) or len(icd_code) < 3:
         return "unknown"
@@ -97,7 +95,7 @@ def get_chapter_from_icd10(icd_code: str) -> str:
             return chapter
     return "unknown"
 
-# Maps ICD-9 code to its major diagnostic chapter
+# Maps ICD-9 code to diagnostic chapter
 def get_chapter_from_icd9(icd_code: str) -> str:
     if icd_code.startswith('E'):
         try:
@@ -107,7 +105,7 @@ def get_chapter_from_icd9(icd_code: str) -> str:
         except (ValueError, IndexError): 
             return "unknown"
     if icd_code.startswith('V'): 
-        return "health_factors"  # ICD-9 V codes = health factors (same as ICD-10 Z codes)
+        return "health_factors"
     try:
         code_num = int(float(icd_code))
         for chapter, (start, end) in ICD9_CHAPTERS.items():
@@ -117,7 +115,7 @@ def get_chapter_from_icd9(icd_code: str) -> str:
         return "unknown"
     return "unknown"
 
-# Determines diagnosis chapter based on ICD version
+# Gets diagnosis chapter from ICD version and code
 def get_diagnosis_chapter(row: pd.Series) -> str:
     version = row['icd_version']
     code = str(row['icd_code'])

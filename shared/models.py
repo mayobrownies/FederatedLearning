@@ -6,6 +6,7 @@ from torch.nn import functional as F
 # ============================================================================
 # DATASETS
 # ============================================================================
+# PyTorch dataset wrapper for MIMIC-IV features and labels
 class MimicDataset(Dataset):
     def __init__(self, features: torch.Tensor, labels: torch.Tensor):
         self.features = features
@@ -20,6 +21,7 @@ class MimicDataset(Dataset):
 # ============================================================================
 # NEURAL NETWORKS
 # ============================================================================
+# Basic neural network with attention mechanism
 class Net(nn.Module):
     def __init__(self, input_dim, output_dim):
         super(Net, self).__init__()
@@ -75,6 +77,7 @@ class Net(nn.Module):
         
         return output
 
+# Advanced neural network with configurable layers
 class AdvancedNet(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_dims=[512, 256, 128], dropout_rate=0.3):
         super(AdvancedNet, self).__init__()
@@ -116,6 +119,7 @@ class AdvancedNet(nn.Module):
 # ============================================================================
 # LOSS FUNCTIONS
 # ============================================================================
+# Focal loss for addressing class imbalance
 class FocalLoss(nn.Module):
     def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
         super(FocalLoss, self).__init__()
@@ -138,6 +142,7 @@ class FocalLoss(nn.Module):
 # ============================================================================
 # MODEL FACTORY
 # ============================================================================
+# Factory function to create neural network models
 def get_model(model_name: str, input_dim: int, output_dim: int):
     if model_name == "basic":
         return Net(input_dim, output_dim)

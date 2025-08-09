@@ -12,8 +12,11 @@ from .task import TOP_ICD_CODES, get_model, load_and_partition_data, create_feat
 from .models import MimicDataset
 from torch.utils.data import DataLoader
 
+# ============================================================================
+# AGGREGATION
+# ============================================================================
+# Aggregates evaluation metrics using weighted average
 def weighted_average(metrics):
-    """Aggregate evaluation metrics using weighted average."""
     try:
         print(f"Aggregating metrics from {len(metrics)} clients...")
         
@@ -36,8 +39,8 @@ def weighted_average(metrics):
         print(f"Error in weighted_average: {e}")
         return {}
 
+# Aggregates fit metrics using weighted average
 def weighted_average_fit(fit_metrics):
-    """Aggregate fit metrics using weighted average."""
     try:
         print(f"Aggregating fit metrics from {len(fit_metrics)} clients...")
         
@@ -65,8 +68,11 @@ def weighted_average_fit(fit_metrics):
         print(f"Error in weighted_average_fit: {e}")
         return {}
 
+# ============================================================================
+# ANALYSIS
+# ============================================================================
+# Displays detailed prediction analysis
 def display_prediction_analysis(predictions, true_labels):
-    """Display detailed prediction analysis."""
     try:
         print("\n" + "="*60)
         print("PREDICTION ANALYSIS")
@@ -128,8 +134,11 @@ def display_prediction_analysis(predictions, true_labels):
         import traceback
         traceback.print_exc()
 
+# ============================================================================
+# TESTING
+# ============================================================================
+# Tests global aggregated model and displays prediction analysis
 def test_global_model(parameters: Parameters, data_dir: str = "mimic-iv-3.1", partition_scheme: str = "heterogeneous", top_k_codes: int = 75) -> None:
-    """Test the global aggregated model and display prediction analysis."""
     try:
         print("\n" + "=" * 80)
         print("TESTING GLOBAL AGGREGATED MODEL")
@@ -217,8 +226,11 @@ def test_global_model(parameters: Parameters, data_dir: str = "mimic-iv-3.1", pa
         import traceback
         traceback.print_exc()
 
+# ============================================================================
+# STRATEGY FACTORY
+# ============================================================================
+# Gets federated learning strategy with aggregation functions
 def get_strategy(strategy_name: str, run_config=None, **kwargs):
-    """Get the appropriate federated learning strategy with proper aggregation functions."""
     
     def evaluate_metrics_aggregation_fn(eval_metrics):
         try:

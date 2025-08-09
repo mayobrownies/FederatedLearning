@@ -17,6 +17,7 @@ import ray
 from shared.client import get_client
 from shared.strategies import get_strategy
 from shared.task import load_and_partition_data, TOP_ICD_CODES, create_features_and_labels, get_global_feature_space
+from shared.data_utils import ICD_CODE_TO_INDEX, INDEX_TO_ICD_CODE
 
 warnings.filterwarnings("ignore", category=UserWarning)
 logging.getLogger("ray").setLevel(logging.WARNING)
@@ -28,13 +29,14 @@ logging.getLogger("flwr").setLevel(logging.WARNING)
 
 # Data and partitioning configuration
 MIMIC_DATA_DIR = "mimic-iv-3.1"
-MIN_PARTITION_SIZE = 1000
+MIN_PARTITION_SIZE = 500
 
 # Model and training configuration
-NUM_ROUNDS = 10
-LOCAL_EPOCHS = 3
+NUM_ROUNDS = 1
+LOCAL_EPOCHS = 1
 BATCH_SIZE = 64
-LEARNING_RATE = 0.0002
+MAX_CLIENTS = 1000  # Use all available partitions
+LEARNING_RATE = 0.0005
 
 # Choose FL strategy: ["fedavg", "fedprox"]
 AVAILABLE_STRATEGIES = ["fedavg", "fedprox"]
@@ -43,6 +45,9 @@ FL_STRATEGY = AVAILABLE_STRATEGIES[0]
 # Choose partitioning scheme: ["heterogeneous", "balanced"]
 AVAILABLE_PARTITIONING = ["heterogeneous", "balanced"]
 PARTITIONING_SCHEME = AVAILABLE_PARTITIONING[0]
+
+# Choose execution mode: [True, False]
+USE_LOCAL_MODE = False  # True = local mode (fast, sequential), False = distributed mode (parallel)
 
 # Choose model from the list: ["basic", "advanced"]
 AVAILABLE_MODELS = ["basic", "advanced"]
@@ -221,6 +226,13 @@ def main():
     
     # Apply filtering based on partitioning scheme (this also does analysis)
     VALID_PARTITIONS = filter_quality_clients(VALID_PARTITIONS, min_top_k_ratio=0.20)
+    
+    # Limit number of clients for testing
+    if len(VALID_PARTITIONS) > MAX_CLIENTS:
+        partition_items = list(VALID_PARTITIONS.items())[:MAX_CLIENTS]
+        VALID_PARTITIONS = dict(partition_items)
+        print(f"Limited to {MAX_CLIENTS} clients for faster testing")
+    
     NUM_CLIENTS = len(VALID_PARTITIONS)
     
     if NUM_CLIENTS == 0:
@@ -229,7 +241,7 @@ def main():
     
     print(f"Using {NUM_CLIENTS} clients for {PARTITIONING_SCHEME} {FL_STRATEGY} simulation")
     
-    # Create run configuration - using both naming conventions for compatibility
+    # Create run configuration based on mode
     run_config = {
         "strategy": FL_STRATEGY,
         "partitioning": PARTITIONING_SCHEME,
@@ -248,9 +260,17 @@ def main():
         "learning-rate": LEARNING_RATE,
         "min-partition-size": MIN_PARTITION_SIZE,
         "data-dir": MIMIC_DATA_DIR,
-        # Pass the pre-computed partitions to avoid recomputing in each client
-        "cached_partitions": VALID_PARTITIONS,
+        "use_local_mode": USE_LOCAL_MODE,
     }
+    
+    # Only pass cached data in local mode to avoid Ray serialization issues
+    if USE_LOCAL_MODE:
+        run_config.update({
+            "cached_partitions": VALID_PARTITIONS,
+            "top_icd_codes_list": TOP_ICD_CODES.copy() if TOP_ICD_CODES else [],
+            "icd_code_to_index": ICD_CODE_TO_INDEX.copy() if ICD_CODE_TO_INDEX else {},
+            "index_to_icd_code": INDEX_TO_ICD_CODE.copy() if INDEX_TO_ICD_CODE else {},
+        })
 
     def client_fn(context: Context) -> fl.client.Client:
         partition_id = hash(context.node_id) % NUM_CLIENTS
@@ -263,7 +283,7 @@ def main():
     
     strategy_desc = f"μ={PROXIMAL_MU}" if FL_STRATEGY == "fedprox" else "no proximal regularization"
     print(f"Configuration: lr={LEARNING_RATE}, {strategy_desc}, local_epochs={LOCAL_EPOCHS}")
-    print(f"Total ICD codes in model: {len(TOP_ICD_CODES)}")
+    print(f"Model output classes: {len(TOP_ICD_CODES) + 1} (top-{len(TOP_ICD_CODES)} ICD codes + 1 'other' class)")
     
     # Initialize Ray
     try:
@@ -272,27 +292,58 @@ def main():
     except Exception as e:
         print(f"No existing Ray instance to shut down: {e}")
     
-    ray_init_args = {
-        "ignore_reinit_error": True,
-        "log_to_driver": False,
-        "include_dashboard": False,
-        "num_cpus": None,
-        "object_store_memory": 1000000000,  # 1GB object store
-        "_temp_dir": None,
-        "local_mode": False,
-    }
+    # Use the configured mode
     
-    client_resources = {"num_cpus": 1, "memory": 2000000000}  # 2GB per client
+    if USE_LOCAL_MODE:
+        # Local mode: cached partitions, dynamic memory
+        object_store_memory = max(500000000, NUM_CLIENTS * 50000000)
+        ray_init_args = {
+            "ignore_reinit_error": True,
+            "log_to_driver": False,
+            "include_dashboard": False,
+            "num_cpus": None,
+            "object_store_memory": object_store_memory,
+            "_temp_dir": None,
+            "local_mode": True,
+        }
+        print(f"[SERVER] Using LOCAL mode with {object_store_memory / 1000000:.0f}MB object store for {NUM_CLIENTS} clients")
+    else:
+        # Distributed mode: independent data loading, fixed resources like old implementation
+        ray_init_args = {
+            "ignore_reinit_error": True,
+            "log_to_driver": False,
+            "include_dashboard": False,
+            "num_cpus": None,
+            "object_store_memory": 1000000000,  # 1GB like old implementation
+            "_temp_dir": None,
+            "local_mode": False,
+        }
+        print(f"[SERVER] Using DISTRIBUTED mode with 1GB object store for {NUM_CLIENTS} clients")
+        print(f"[SERVER] Each client will load data independently")
     
     # Start simulation
-    history = fl.simulation.start_simulation(
-        client_fn=client_fn,
-        num_clients=NUM_CLIENTS,
-        config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
-        strategy=strategy,
-        client_resources=client_resources,
-        ray_init_args=ray_init_args
-    )
+    print(f"\n[SERVER] Starting federated learning simulation...")
+    print(f"[SERVER] {NUM_CLIENTS} clients will train for {NUM_ROUNDS} rounds")
+    print(f"[SERVER] Ray is initializing {NUM_CLIENTS} client actors... (this may take a few minutes)")
+    if not USE_LOCAL_MODE:
+        print(f"[SERVER] High disk usage is normal during initialization - Ray is setting up distributed storage")
+    
+    # Configure simulation parameters based on mode
+    simulation_args = {
+        "client_fn": client_fn,
+        "num_clients": NUM_CLIENTS,
+        "config": fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
+        "strategy": strategy,
+        "ray_init_args": ray_init_args
+    }
+    
+    # Add client resources only for distributed mode
+    if not USE_LOCAL_MODE:
+        simulation_args["client_resources"] = {"num_cpus": 1, "memory": 512000000}  # 512MB per client to avoid OOM
+    
+    history = fl.simulation.start_simulation(**simulation_args)
+    
+    print(f"[SERVER] Simulation completed!")
 
     print("Simulation finished.")
     

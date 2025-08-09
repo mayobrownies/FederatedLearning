@@ -17,170 +17,23 @@ from torch.utils.data import DataLoader, Dataset
 from flwr.common import parameters_to_ndarrays
 from torch.nn import functional as F
 
-# ============================================================================
-# ICD CODE MAPPINGS
-# ============================================================================
-ICD9_CHAPTERS = {
-    "infectious_parasitic": (1, 139), "neoplasms": (140, 239),
-    "endocrine_metabolic": (240, 279), "blood": (280, 289),
-    "mental": (290, 319), "nervous": (320, 389), "circulatory": (390, 459),
-    "respiratory": (460, 519), "digestive": (520, 579), "genitourinary": (580, 629),
-    "pregnancy_childbirth": (630, 679), "skin": (680, 709),
-    "musculoskeletal": (710, 739), "congenital": (740, 759),
-    "perinatal": (760, 779), "symptoms_ill_defined": (780, 799),
-    "injury_poisoning": (800, 999), "e_codes": (1000, 2000),
-}
+# Import separated components
+from .models import MimicDataset, Net, AdvancedNet, get_model, FocalLoss
+from .partitioning import create_heterogeneous_partitions, create_balanced_partitions
+from .data_utils import (
+    ICD9_CHAPTERS, ICD10_CHAPTERS, ALL_CHAPTERS, CHAPTER_TO_INDEX, INDEX_TO_CHAPTER,
+    TOP_ICD_CODES, ICD_CODE_TO_INDEX, INDEX_TO_ICD_CODE,
+    initialize_top_icd_codes, get_chapter_from_icd9, get_chapter_from_icd10, get_diagnosis_chapter
+)
 
-ICD10_CHAPTERS = {
-    "infectious_parasitic": ("A00", "B99"), "neoplasms": ("C00", "D49"),
-    "blood": ("D50", "D89"), "endocrine_metabolic": ("E00", "E89"),
-    "mental": ("F01", "F99"), "nervous": ("G00", "G99"), "eye": ("H00", "H59"),
-    "ear": ("H60", "H95"), "circulatory": ("I00", "I99"),
-    "respiratory": ("J00", "J99"), "digestive": ("K00", "K95"),
-    "skin": ("L00", "L99"), "musculoskeletal": ("M00", "M99"),
-    "genitourinary": ("N00", "N99"), "pregnancy_childbirth": ("O00", "O9A"),
-    "perinatal": ("P00", "P96"), "congenital": ("Q00", "Q99"),
-    "symptoms_ill_defined": ("R00", "R99"), "injury_poisoning": ("S00", "T88"),
-    "external_causes": ("V00", "Y99"), "health_factors": ("Z00", "Z99"),
-}
-
-ALL_CHAPTERS = [
-    "infectious_parasitic", "neoplasms", "blood", "endocrine_metabolic", 
-    "mental", "nervous", "eye", "ear", "circulatory", "respiratory", 
-    "digestive", "skin", "musculoskeletal", "genitourinary", 
-    "pregnancy_childbirth", "perinatal", "congenital", "symptoms_ill_defined", 
-    "injury_poisoning", "external_causes", "health_factors"
-]
-
-CHAPTER_TO_INDEX = {chapter: idx for idx, chapter in enumerate(ALL_CHAPTERS)}
-INDEX_TO_CHAPTER = {idx: chapter for chapter, idx in CHAPTER_TO_INDEX.items()}
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-TOP_K_CODES = 100
-TOP_ICD_CODES = []
-ICD_CODE_TO_INDEX = {}
-INDEX_TO_ICD_CODE = {}
-
-def set_top_k_codes(k: int):
-    global TOP_K_CODES, TOP_ICD_CODES, ICD_CODE_TO_INDEX, INDEX_TO_ICD_CODE
-    TOP_K_CODES = k
-    # Clear existing mappings so they get recomputed
-    TOP_ICD_CODES.clear()
-    ICD_CODE_TO_INDEX.clear()
-    INDEX_TO_ICD_CODE.clear()
-    print(f"Set TOP_K_CODES to {k}. Mappings will be recomputed on next data load.")
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 FEATURE_CACHE_DIR = os.path.join(project_root, "feature_cache")
 
 # ============================================================================
-# PARTITIONING STRATEGIES
+# DATA LOADING
 # ============================================================================
-def create_heterogeneous_partitions(data: pd.DataFrame, min_partition_size: int = 1000) -> Dict[str, pd.DataFrame]:
-    print("Creating heterogeneous partitions (one chapter per client)...")
-    
-    icd_counts = data['icd_code'].value_counts()
-    top_codes = set(icd_counts.head(TOP_K_CODES).index.tolist())
-    
-    data['has_top_k_code'] = data['icd_code'].isin(top_codes)
-    
-    chapter_groups = data.groupby('diagnosis_chapter')
-    
-    partitions = {}
-    
-    for chapter, chapter_data in chapter_groups:
-        top_k_count = chapter_data['has_top_k_code'].sum()
-        top_k_ratio = top_k_count / len(chapter_data)
-        
-        if len(chapter_data) >= min_partition_size:
-            partitions[f"{chapter}"] = chapter_data
-            print(f"Chapter client '{chapter}': {len(chapter_data)} samples, {top_k_ratio:.2%} top-K")
-        else:
-            print(f"Skipping chapter '{chapter}': only {len(chapter_data)} samples (< {min_partition_size})")
-    
-    print(f"Created {len(partitions)} heterogeneous partitions (one per chapter)")
-    return partitions
-
-def create_balanced_partitions(data: pd.DataFrame, min_partition_size: int = 1000, top_k_codes: int = 75) -> Dict[str, pd.DataFrame]:
-    print("Creating balanced partitions...")
-    
-    icd_counts = data['icd_code'].value_counts()
-    top_codes = set(icd_counts.head(top_k_codes).index.tolist())
-    
-    data['has_top_k_code'] = data['icd_code'].isin(top_codes)
-    
-    # Calculate number of partitions based on data size
-    total_samples = len(data)
-    num_partitions = max(2, total_samples // min_partition_size)
-    
-    # Shuffle data to ensure random distribution
-    data_shuffled = data.sample(frac=1, random_state=42).reset_index(drop=True)
-    
-    partitions = {}
-    partition_size = total_samples // num_partitions
-    
-    for i in range(num_partitions):
-        start_idx = i * partition_size
-        end_idx = start_idx + partition_size if i < num_partitions - 1 else total_samples
-        
-        partition_data = data_shuffled.iloc[start_idx:end_idx].copy()
-        
-        # Only include if it meets minimum size requirement
-        if len(partition_data) >= min_partition_size:
-            top_k_count = partition_data['has_top_k_code'].sum()
-            top_k_ratio = top_k_count / len(partition_data)
-            
-            partition_name = f"balanced_{i+1}"
-            partitions[partition_name] = partition_data
-            
-            print(f"Partition '{partition_name}': {len(partition_data)} samples, {top_k_ratio:.2%} top-K")
-    
-    print(f"Created {len(partitions)} balanced partitions")
-    return partitions
-
-# Maps ICD-10 code to its major diagnostic chapter
-def get_chapter_from_icd10(icd_code: str) -> str:
-    if not isinstance(icd_code, str) or len(icd_code) < 3:
-        return "unknown"
-    code_prefix = icd_code[:3].upper()
-    for chapter, (start, end) in ICD10_CHAPTERS.items():
-        if start <= code_prefix <= end:
-            return chapter
-    return "unknown"
-
-# Maps ICD-9 code to its major diagnostic chapter
-def get_chapter_from_icd9(icd_code: str) -> str:
-    if icd_code.startswith('E'):
-        try:
-            code_num = int(icd_code[1:4])
-            if 1000 <= code_num <= 2000: 
-                return "e_codes"
-        except (ValueError, IndexError): 
-            return "unknown"
-    if icd_code.startswith('V'): 
-        return "health_factors"  # ICD-9 V codes = health factors (same as ICD-10 Z codes)
-    try:
-        code_num = int(float(icd_code))
-        for chapter, (start, end) in ICD9_CHAPTERS.items():
-            if start <= code_num <= end: 
-                return chapter
-    except ValueError: 
-        return "unknown"
-    return "unknown"
-
-# Determines diagnosis chapter based on ICD version
-def get_diagnosis_chapter(row: pd.Series) -> str:
-    version = row['icd_version']
-    code = str(row['icd_code'])
-    if version == 9:
-        return get_chapter_from_icd9(code)
-    elif version == 10:
-        return get_chapter_from_icd10(code)
-    return "unknown"
-
-# Loads MIMIC-IV data and partitions by primary diagnosis chapter
+# Loads MIMIC-IV data and partitions by diagnosis chapter
 def load_and_partition_data(data_dir: str, min_partition_size: int = 1000, partition_scheme: str = "heterogeneous", top_k_codes: int = 75) -> Dict[str, pd.DataFrame]:
     print("Loading MIMIC-IV data...")
     try:
@@ -238,86 +91,14 @@ def load_and_partition_data(data_dir: str, min_partition_size: int = 1000, parti
     return valid_partitions
 
 # Initializes global ICD code mappings for the top K most frequent codes
-def initialize_top_icd_codes(data: pd.DataFrame, top_k_codes: int = 75):
-    global TOP_K_CODES, TOP_ICD_CODES, ICD_CODE_TO_INDEX, INDEX_TO_ICD_CODE
-    
-    # Handle unlimited case (all ICD codes)
-    if top_k_codes is None:
-        print("Finding ALL ICD codes (no limit)...")
-        # Count frequency of each ICD code
-        icd_counts = data['icd_code'].value_counts()
-        
-        # Use ALL codes
-        all_codes = icd_counts.index.tolist()
-        TOP_K_CODES = len(all_codes)  # Set to actual count
-        
-        # Clear existing mappings
-        TOP_ICD_CODES.clear()
-        ICD_CODE_TO_INDEX.clear()
-        INDEX_TO_ICD_CODE.clear()
-        
-        # Create mappings for all codes
-        TOP_ICD_CODES.extend(all_codes)
-        ICD_CODE_TO_INDEX.update({code: idx for idx, code in enumerate(all_codes)})
-        INDEX_TO_ICD_CODE.update({idx: code for idx, code in enumerate(all_codes)})
-        
-        print(f"Using ALL {len(TOP_ICD_CODES)} ICD codes")
-        print(f"Most frequent codes: {TOP_ICD_CODES[:10]}...")
-        print(f"Code frequencies: {[icd_counts[code] for code in TOP_ICD_CODES[:10]]}")
-        return
-    
-    # Handle limited TOP_K case
-    TOP_K_CODES = top_k_codes
-    
-    if len(TOP_ICD_CODES) > 0 and len(TOP_ICD_CODES) == top_k_codes:  # Already initialized with correct count
-        print(f"ICD codes already initialized with {len(TOP_ICD_CODES)} codes")
-        return
-    
-    print(f"Finding top {TOP_K_CODES} most frequent ICD codes...")
-    
-    # Count frequency of each ICD code
-    icd_counts = data['icd_code'].value_counts()
-    
-    # Get top K codes
-    top_codes = icd_counts.head(TOP_K_CODES).index.tolist()
-    
-    # Clear existing mappings
-    TOP_ICD_CODES.clear()
-    ICD_CODE_TO_INDEX.clear() 
-    INDEX_TO_ICD_CODE.clear()
-    
-    # Create mappings
-    TOP_ICD_CODES.extend(top_codes)
-    ICD_CODE_TO_INDEX.update({code: idx for idx, code in enumerate(top_codes)})
-    INDEX_TO_ICD_CODE.update({idx: code for idx, code in enumerate(top_codes)})
-    
-    print(f"Top {len(TOP_ICD_CODES)} ICD codes selected for prediction")
-    print(f"Most frequent codes: {TOP_ICD_CODES[:10]}...")
-    print(f"Code frequencies: {[icd_counts[code] for code in TOP_ICD_CODES[:10]]}")
+# REMOVED: initialize_top_icd_codes function now imported from data_utils.py
 
-# Checks if a chapter contains any of the top K ICD codes
-def has_top_k_codes(df: pd.DataFrame) -> bool:
-    if len(TOP_ICD_CODES) == 0:
-        print("Warning: TOP_ICD_CODES not yet initialized, assuming all chapters are valid")
-        return True
-    
-    # Check if any ICD codes in this chapter are in the global top K
-    chapter_codes = set(df['icd_code'].astype(str).unique())
-    top_k_codes_set = set(TOP_ICD_CODES)
-    
-    intersection = chapter_codes.intersection(top_k_codes_set)
-    has_codes = len(intersection) > 0
-    
-    if has_codes:
-        print(f"Chapter has {len(intersection)} top-{TOP_K_CODES} codes: {list(intersection)[:5]}...")
-    else:
-        print(f"Chapter has NO top-{TOP_K_CODES} codes (all would be 'other' class)")
-    
-    return has_codes
-
-# Determines global feature space by examining all partitions
+# ============================================================================
+# FEATURE ENGINEERING
+# ============================================================================
+# Determines global feature space across all partitions
 def get_global_feature_space(data_dir: str = "mimic-iv-3.1") -> Dict[str, List[str]]:
-    print("Determining global feature space...")
+    print("[CACHE] Determining global feature space...")
     
     partitions = load_and_partition_data(data_dir)
     valid_partitions = {ch: df for ch, df in partitions.items() if len(df) >= 20}
@@ -342,6 +123,7 @@ def get_global_feature_space(data_dir: str = "mimic-iv-3.1") -> Dict[str, List[s
     return global_feature_values
 
 # Creates feature matrix and labels for ICD code prediction
+# Creates feature matrix and labels from medical data
 def create_features_and_labels(df: pd.DataFrame, partition_chapter: str, global_feature_space: Dict[str, List[str]] = None, top_n_cat: int = 10, include_icd_features: bool = True) -> Tuple[pd.DataFrame, pd.Series]:
     try:
         # Create labels: map ICD codes to global top K indices, or use -1 for "other"
@@ -379,14 +161,14 @@ def create_features_and_labels(df: pd.DataFrame, partition_chapter: str, global_
         
         feature_mode = "with ICD features" if include_icd_features else "without ICD features (validation mode)"
         print(f"Chapter '{partition_chapter}': {len(labels)} samples total ({feature_mode})")
-        print(f"  - {top_k_count} samples from {unique_top_k} top-{TOP_K_CODES} ICD codes")
+        print(f"  - {top_k_count} samples from {unique_top_k} top-{len(TOP_ICD_CODES)} ICD codes")
         print(f"  - {other_count} samples from other ICD codes (labeled as 'other')")
         
         # CRITICAL: Warn if client has no top-K codes (will only learn "other")
         if unique_top_k == 0:
-            print(f"⚠️  WARNING: Chapter '{partition_chapter}' has NO top-{TOP_K_CODES} codes!")
+            print(f"⚠️  WARNING: Chapter '{partition_chapter}' has NO top-{len(TOP_ICD_CODES)} codes!")
             print(f"   This client will only learn to predict 'other' class.")
-            print(f"   Consider: (1) increasing TOP_K_CODES, (2) different partitioning, or (3) skip this client")
+            print(f"   Consider: (1) increasing top_k_codes, (2) different partitioning, or (3) skip this client")
         
         features_list = []
         
@@ -537,11 +319,22 @@ def create_features_and_labels(df: pd.DataFrame, partition_chapter: str, global_
         return dummy_features, dummy_labels
 
 # Loads and preprocesses data for a specific partition
-def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1", min_partition_size: int = 1000, partition_scheme: str = "heterogeneous", top_k_codes: int = 75, cached_partitions: Dict = None):
+# ============================================================================
+# DATA LOADING
+# ============================================================================
+# Loads partition data and creates PyTorch dataloaders
+def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1", min_partition_size: int = 1000, partition_scheme: str = "heterogeneous", top_k_codes: int = 75, cached_partitions: Dict = None, precomputed_icd_data: Dict = None):
     try:
         if cached_partitions is not None:
             # Use pre-computed partitions to avoid recomputing
             valid_partitions = cached_partitions
+            
+            # Initialize TOP_ICD_CODES from precomputed data if available
+            global TOP_ICD_CODES, ICD_CODE_TO_INDEX, INDEX_TO_ICD_CODE
+            if precomputed_icd_data and len(TOP_ICD_CODES) == 0:
+                TOP_ICD_CODES.extend(precomputed_icd_data.get("top_icd_codes_list", []))
+                ICD_CODE_TO_INDEX.update(precomputed_icd_data.get("icd_code_to_index", {}))
+                INDEX_TO_ICD_CODE.update(precomputed_icd_data.get("index_to_icd_code", {}))
         else:
             # Fallback to computing partitions (for backward compatibility)
             partitions = load_and_partition_data(data_dir, min_partition_size, partition_scheme, top_k_codes)
@@ -556,7 +349,8 @@ def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1"
         partition_name = partition_names[partition_id]
         partition_data = valid_partitions[partition_name]
         
-        print(f"Client {partition_id} assigned to partition: '{partition_name}' ({len(partition_data)} admissions)")
+        print(f"[CLIENT {partition_id}] Assigned to partition: '{partition_name}' ({len(partition_data)} admissions)")
+        print(f"[CLIENT {partition_id}] Loading training and evaluation data...")
         
         # Training data: Use ONLY non-ICD features for fair evaluation
         train_features, train_labels = create_features_and_labels(
@@ -674,10 +468,11 @@ def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1"
         testloader = DataLoader(eval_dataset, batch_size=min(batch_size, len(eval_dataset)), shuffle=False)
         
         input_dim = X_train.shape[1]
-        output_dim = len(TOP_ICD_CODES) + 1  # +1 for "other" class
+        output_dim = top_k_codes + 1  # +1 for "other" class
         
-        print(f"Created dataloaders: train_size={len(train_dataset)}, test_size={len(eval_dataset)}, input_dim={input_dim}, output_dim={output_dim}")
-        print(f"Model will predict {len(TOP_ICD_CODES)} top ICD codes + 1 'other' class = {output_dim} total classes")
+        print(f"[CLIENT {partition_id}] Created dataloaders: train_size={len(train_dataset)}, test_size={len(eval_dataset)}")
+        print(f"[CLIENT {partition_id}] Model dimensions: input={input_dim}, output={output_dim} (top-{top_k_codes} + other)")
+        print(f"[CLIENT {partition_id}] Data loading completed successfully")
         
         return trainloader, testloader, input_dim, output_dim
         
@@ -714,151 +509,22 @@ def create_partition_dataloaders(data, mlb, all_feature_cols, partition_id, part
     return trainloader, testloader, len(all_feature_cols), len(mlb.classes_)
 
 # PyTorch Dataset for MIMIC-IV data
-class MimicDataset(Dataset):
-    def __init__(self, features: np.ndarray, labels: np.ndarray):
-        self.features = torch.tensor(features, dtype=torch.float32)
-        self.labels = torch.tensor(labels, dtype=torch.long)
-    
-    def __len__(self):
-        return len(self.labels)
-    
-    def __getitem__(self, idx):
-        return self.features[idx], self.labels[idx]
 
-# Creates the neural network model for ICD code prediction
-def get_model(model_name_or_input_dim, input_dim=None, hidden_dim: int = 128, output_dim: int = None, use_advanced: bool = True) -> torch.nn.Module:
-    """
-    Get model - supports both old signature get_model(input_dim, ...) and new signature get_model(model_name, input_dim, ...)
-    """
-    # Handle both signatures for backward compatibility
-    if isinstance(model_name_or_input_dim, str):
-        # New signature: get_model(model_name, input_dim, ...)
-        model_name = model_name_or_input_dim
-        actual_input_dim = input_dim
-        use_advanced = (model_name == "advanced")
-    else:
-        # Old signature: get_model(input_dim, ...)
-        actual_input_dim = model_name_or_input_dim
-        use_advanced = use_advanced  # Use the parameter as passed
-    if output_dim is None:
-        output_dim = len(TOP_ICD_CODES) + 1  # +1 for "other" class
-    
-    if use_advanced:
-        # Use advanced architecture with attention and residual connections
-        return AdvancedNet(input_dim, output_dim, hidden_dims=[512, 256, 128], dropout_rate=0.3)
-    else:
-        # Use simple architecture
-        return Net(input_dim, output_dim)
 
-# Neural network architecture for ICD code classification
-class Net(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(Net, self).__init__()
-        
-        # More sophisticated architecture for medical prediction
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        
-        # Feature preprocessing layers
-        self.feature_norm = nn.BatchNorm1d(input_dim)
-        
-        # Deeper network with residual connections
-        self.fc1 = nn.Linear(input_dim, 512)
-        self.bn1 = nn.BatchNorm1d(512)
-        self.fc2 = nn.Linear(512, 256)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.fc3 = nn.Linear(256, 256)
-        self.bn3 = nn.BatchNorm1d(256)
-        self.fc4 = nn.Linear(256, 128)
-        self.bn4 = nn.BatchNorm1d(128)
-        
-        # Attention mechanism for medical feature importance
-        self.attention = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, 128),
-            nn.Sigmoid()
-        )
-        
-        # Final classification layers
-        self.classifier = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(64, output_dim)
-        )
-        
-        # Dropout layers
-        self.dropout1 = nn.Dropout(0.2)
-        self.dropout2 = nn.Dropout(0.3)
-        self.dropout3 = nn.Dropout(0.3)
-        
-    def forward(self, x):
-        # Input normalization
-        x = self.feature_norm(x)
-        
-        # Feature extraction with residual connections
-        # Block 1
-        x1 = torch.relu(self.bn1(self.fc1(x)))
-        x1 = self.dropout1(x1)
-        
-        # Block 2
-        x2 = torch.relu(self.bn2(self.fc2(x1)))
-        x2 = self.dropout2(x2)
-        
-        # Block 3 with residual connection
-        x3 = torch.relu(self.bn3(self.fc3(x2)))
-        x3 = self.dropout3(x3)
-        
-        # Block 4 with residual connection
-        x4 = torch.relu(self.bn4(self.fc4(x3 + x2)))  # Residual connection
-        
-        # Attention mechanism - learn which features are important
-        attention_weights = self.attention(x4)
-        x4_attended = x4 * attention_weights
-        
-        # Final classification
-        output = self.classifier(x4_attended)
-        
-        return output
 
-class FocalLoss(nn.Module):
-    """
-    Focal Loss for addressing class imbalance in ICD prediction.
-    Focuses training on hard examples and down-weights easy examples.
-    """
-    def __init__(self, alpha=1.0, gamma=2.0, reduction='mean'):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-        
-    def forward(self, inputs, targets):
-        # Compute cross entropy
-        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
-        
-        # Compute p_t
-        pt = torch.exp(-ce_loss)
-        
-        # Compute focal loss
-        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
-        
-        if self.reduction == 'mean':
-            return focal_loss.mean()
-        elif self.reduction == 'sum':
-            return focal_loss.sum()
-        else:
-            return focal_loss
 
 # Trains the model with FedProx regularization
+# ============================================================================
+# TRAINING
+# ============================================================================
+# Trains model with FedProx regularization
 def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, device, use_focal_loss=False):
     # Calculate class weights from this client's data
     all_labels = []
     for _, labels in trainloader:
         all_labels.extend(labels.numpy())
     
-    class_counts = np.bincount(all_labels, minlength=TOP_K_CODES + 1)  # TOP_K + 1 for 'other' class
+    class_counts = np.bincount(all_labels, minlength=len(TOP_ICD_CODES) + 1)  # TOP_K + 1 for 'other' class
     class_weights = 1.0 / (class_counts + 1e-6)  # Avoid division by zero
     class_weights = class_weights / class_weights.sum() * len(class_weights)  # Normalize
     class_weights = torch.FloatTensor(class_weights).to(device)
@@ -913,6 +579,7 @@ def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, devi
     return avg_loss
 
 # Displays comprehensive prediction analysis with class distribution
+# Displays detailed prediction analysis
 def display_prediction_analysis(all_predictions, all_labels):
     """
     Comprehensive analysis of model predictions vs actual labels
@@ -1003,6 +670,10 @@ def display_prediction_analysis(all_predictions, all_labels):
     print("="*80)
 
 # Tests the model and returns evaluation metrics
+# ============================================================================
+# TESTING
+# ============================================================================
+# Tests model and returns loss and metrics
 def test(net, testloader, device):
     try:
         criterion = nn.CrossEntropyLoss()
@@ -1061,9 +732,14 @@ def test(net, testloader, device):
         }
 
 # Extracts model weights as numpy arrays
+# ============================================================================
+# MODEL UTILITIES
+# ============================================================================
+# Extracts model weights as numpy arrays
 def get_weights(net: torch.nn.Module):
     return [val.cpu().numpy() for _, val in net.state_dict().items()]
 
+# Sets model weights from numpy arrays
 # Sets model weights from numpy arrays
 def set_weights(net: torch.nn.Module, parameters):
     params_dict = zip(net.state_dict().keys(), parameters)
@@ -1163,7 +839,7 @@ def get_medication_features(hadm_ids: List[int], data_dir: str = "mimic-iv-3.1")
                     if hadm_id not in med_features:
                         continue
                     
-                    drugs_lower = group['drug'].str.lower()
+                    drugs_lower = group['drug'].fillna('').str.lower()
                     unique_drugs = group['drug'].nunique()
                     
                     med_features[hadm_id]['med_total_count'] = len(group)
@@ -1184,7 +860,7 @@ def get_medication_features(hadm_ids: List[int], data_dir: str = "mimic-iv-3.1")
                     # Controlled substances (simplified detection)
                     controlled_substances = ['morphine', 'fentanyl', 'oxycodone', 'midazolam', 'lorazepam', 'propofol']
                     med_features[hadm_id]['has_controlled_substance'] = int(any(
-                        any(cs in drug.lower() for cs in controlled_substances) for drug in group['drug']
+                        any(cs in str(drug).lower() for cs in controlled_substances) for drug in group['drug'].fillna('') if drug
                     ))
                     
                     # Category analysis with enhanced features
@@ -1193,8 +869,8 @@ def get_medication_features(hadm_ids: List[int], data_dir: str = "mimic-iv-3.1")
                         category_drugs = []
                         category_count = 0
                         
-                        for drug in group['drug']:
-                            if any(med_drug in drug.lower() for med_drug in drug_list):
+                        for drug in group['drug'].fillna(''):
+                            if drug and any(med_drug in str(drug).lower() for med_drug in drug_list):
                                 category_drugs.append(drug)
                                 category_count += 1
                         
@@ -1207,8 +883,8 @@ def get_medication_features(hadm_ids: List[int], data_dir: str = "mimic-iv-3.1")
                     # High-risk combinations
                     risk_combinations = 0
                     for drug1, drug2 in high_risk_combinations:
-                        has_drug1 = any(drug1 in drug.lower() for drug in group['drug'])
-                        has_drug2 = any(drug2 in drug.lower() for drug in group['drug'])
+                        has_drug1 = any(drug1 in str(drug).lower() for drug in group['drug'].fillna('') if drug)
+                        has_drug2 = any(drug2 in str(drug).lower() for drug in group['drug'].fillna('') if drug)
                         if has_drug1 and has_drug2:
                             risk_combinations += 1
                     
@@ -1501,12 +1177,22 @@ def preprocess_all_medical_features(data_dir: str = "mimic-iv-3.1", force_recomp
     except Exception as e:
         print(f"Warning: Could not clean cache files: {e}")
     
-    partitions = load_and_partition_data(data_dir)
-    valid_partitions = {ch: df for ch, df in partitions.items() if len(df) >= 20}
-    all_hadm_ids = set()
-    for df in valid_partitions.values():
-        all_hadm_ids.update(df['hadm_id'].tolist())
-    all_hadm_ids = list(all_hadm_ids)
+    # Load admission IDs directly from admissions file (much faster than partitioning)
+    print("Loading admission IDs from admissions file...")
+    try:
+        admissions_path = os.path.join(data_dir, "hosp", "admissions.csv.gz")
+        admissions = pd.read_csv(admissions_path, compression='gzip', usecols=['hadm_id'])
+        all_hadm_ids = admissions['hadm_id'].unique().tolist()
+        print(f"Found {len(all_hadm_ids)} unique admissions")
+    except Exception as e:
+        print(f"Error loading admissions: {e}")
+        print("Falling back to partitioning method...")
+        partitions = load_and_partition_data(data_dir)
+        valid_partitions = {ch: df for ch, df in partitions.items() if len(df) >= 20}
+        all_hadm_ids = set()
+        for df in valid_partitions.values():
+            all_hadm_ids.update(df['hadm_id'].tolist())
+        all_hadm_ids = list(all_hadm_ids)
     
     print(f"Preprocessing features for {len(all_hadm_ids)} admissions...")
     
@@ -2339,8 +2025,8 @@ def compute_medication_features(all_hadm_ids: List[int], data_dir: str) -> pd.Da
                         category_drugs = []
                         category_count = 0
                         
-                        for drug in group['drug']:
-                            if any(med_drug in drug.lower() for med_drug in drug_list):
+                        for drug in group['drug'].fillna(''):
+                            if drug and any(med_drug in str(drug).lower() for med_drug in drug_list):
                                 category_drugs.append(drug)
                                 category_count += 1
                         
@@ -2907,95 +2593,3 @@ def get_medical_features_for_admissions(hadm_ids: List[int], data_dir: str = "mi
         print(f"Error loading medical features: {e}")
         return pd.DataFrame(index=hadm_ids)
 
-class AdvancedNet(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dims=[512, 256, 128], dropout_rate=0.3):
-        super(AdvancedNet, self).__init__()
-        
-        # Feature preprocessing layers
-        self.input_bn = nn.BatchNorm1d(input_dim)
-        self.input_dropout = nn.Dropout(dropout_rate * 0.5)  # Lower dropout for input
-        
-        # Build hidden layers with residual connections
-        layers = []
-        current_dim = input_dim
-        
-        for i, hidden_dim in enumerate(hidden_dims):
-            # Main pathway
-            layers.append(nn.Linear(current_dim, hidden_dim))
-            layers.append(nn.BatchNorm1d(hidden_dim))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout_rate))
-            
-            # Store for potential residual connection
-            if i > 0 and current_dim == hidden_dim:
-                # Add residual layer (skip connection)
-                layers.append(ResidualBlock(hidden_dim))
-            
-            current_dim = hidden_dim
-        
-        self.hidden_layers = nn.Sequential(*layers)
-        
-        # Attention mechanism for feature importance
-        self.attention = nn.Sequential(
-            nn.Linear(current_dim, current_dim // 2),
-            nn.Tanh(),
-            nn.Linear(current_dim // 2, current_dim),
-            nn.Sigmoid()
-        )
-        
-        # Output layers
-        self.output_layers = nn.Sequential(
-            nn.Linear(current_dim, current_dim // 2),
-            nn.BatchNorm1d(current_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate * 0.5),
-            nn.Linear(current_dim // 2, output_dim)
-        )
-        
-        # Initialize weights
-        self.apply(self._init_weights)
-    
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.BatchNorm1d):
-            nn.init.ones_(module.weight)
-            nn.init.zeros_(module.bias)
-    
-    def forward(self, x):
-        # Input normalization and dropout
-        x = self.input_bn(x)
-        x = self.input_dropout(x)
-        
-        # Hidden layers
-        x = self.hidden_layers(x)
-        
-        # Attention mechanism
-        attention_weights = self.attention(x)
-        x = x * attention_weights  # Apply attention
-        
-        # Output
-        x = self.output_layers(x)
-        return x
-
-class ResidualBlock(nn.Module):
-    def __init__(self, dim):
-        super(ResidualBlock, self).__init__()
-        self.block = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.BatchNorm1d(dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(dim, dim),
-            nn.BatchNorm1d(dim)
-        )
-        self.relu = nn.ReLU()
-    
-    def forward(self, x):
-        residual = x
-        out = self.block(x)
-        out += residual  # Skip connection
-        out = self.relu(out)
-        return out

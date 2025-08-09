@@ -618,7 +618,7 @@ MIN_PARTITION_SIZE = 500
 BATCH_SIZE = 128
 LOCAL_EPOCHS = 40
 LEARNING_RATE = 0.0005
-TOP_K_CODES = 100
+TOP_K_CODES = 100  # Number of top ICD codes to predict (+ 1 'other' class)
 ACTUAL_NUM_CLASSES = None
 
 AVAILABLE_MODELS: List[str] = [

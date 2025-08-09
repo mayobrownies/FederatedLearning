@@ -7,7 +7,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from hybrid_fedprox.task import preprocess_all_medical_features
+from shared.task import preprocess_all_medical_features
 
 # ============================================================================
 # PREPROCESSING PIPELINE
@@ -109,9 +109,7 @@ def main():
         print("  - Only clinical indicators and administrative data included")
         print()
         print("You can now run the federated learning simulation with clean medical features!")
-        print("   python heterogeneous_fedavg/run.py")
-        print("   python heterogeneous_fedprox/run.py")
-        print("   python hybrid_fedprox/run.py")
+        print("   python shared/run.py")
         print()
         
     except KeyboardInterrupt:
