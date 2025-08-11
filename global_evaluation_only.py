@@ -22,7 +22,7 @@ from collections import defaultdict
 import time
 import pickle
 from pathlib import Path
-from train_isolated import create_icd_frequency_tiers, evaluate_on_global_dataset, plot_global_comparison, plot_enhanced_global_comparison, PARTITION_SCHEME, MIMIC_DATA_DIR, MIN_PARTITION_SIZE, TOP_K_CODES
+from train_isolated import create_icd_frequency_tiers, evaluate_on_global_dataset, plot_enhanced_global_comparison, PARTITION_SCHEME, MIMIC_DATA_DIR, MIN_PARTITION_SIZE, TOP_K_CODES
 from shared.task import load_and_partition_data
 
 # ============================================================================
@@ -92,19 +92,14 @@ def main():
     icd_frequency_tiers = create_icd_frequency_tiers()
     
     import train_isolated
-    unique_labels = set()
-    for chapter, df in partitions.items():
-        if 'ICD_CODE' in df.columns:
-            unique_labels.update(df['ICD_CODE'].unique())
-    
-    train_isolated.ACTUAL_NUM_CLASSES = max(unique_labels) + 1 if unique_labels else 9554
-    print(f"Set ACTUAL_NUM_CLASSES to {train_isolated.ACTUAL_NUM_CLASSES}")
+    # Set ACTUAL_NUM_CLASSES based on TOP_K_CODES (100 top codes + 1 'other' = 101 classes)
+    train_isolated.ACTUAL_NUM_CLASSES = TOP_K_CODES + 1
+    print(f"Using ACTUAL_NUM_CLASSES = {train_isolated.ACTUAL_NUM_CLASSES}")
     
     print("\nStarting global dataset evaluation...")
     global_results = evaluate_on_global_dataset(partitions, global_feature_space, icd_frequency_tiers)
     
-    print("\nGenerating global comparison plots...")
-    plot_global_comparison(global_results)
+    print("\nGenerating enhanced global comparison plots...")
     plot_enhanced_global_comparison(global_results)
     
     print(f"\n{'='*80}")

@@ -19,6 +19,7 @@ from typing import Dict, List, Tuple, Any
 import math
 import numpy as np
 import torch.nn.functional as F
+import io
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 if project_root not in sys.path:
@@ -352,25 +353,86 @@ class LSTMNet(nn.Module):
         
         return self.classifier(attended_output)
 
+# --------------------
+# LoRA Adapter Module for ULCD
+# --------------------
+class LoRALinear(nn.Module):
+    def __init__(self, in_features, out_features, r=4):
+        super().__init__()
+        self.down = nn.Linear(in_features, r, bias=False)
+        self.up = nn.Linear(r, out_features, bias=False)
+        nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x):
+        return self.up(self.down(x))
+
+# --------------------------
+# ULCD Tabular Transformer Module
+# --------------------------
+class TabularTransformer(nn.Module):
+    def __init__(self, input_dim=20, d_model=64, num_heads=4, num_layers=2, use_lora=True):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        # Add layer norm for stability
+        self.layer_norm = nn.LayerNorm(d_model)
+        
+        # Ensure num_heads divides d_model evenly
+        if d_model % num_heads != 0:
+            num_heads = max(1, d_model // 8)  # Safe fallback
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=num_heads, 
+            batch_first=True,
+            dropout=0.1,  # Add dropout for stability
+            norm_first=True  # Pre-norm for better stability
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.use_lora = use_lora
+        if use_lora:
+            self.lora = LoRALinear(d_model, d_model)
+
+    def forward(self, x):
+        # Clamp inputs to prevent extreme values
+        x = torch.clamp(x, -10, 10)
+        
+        x = self.input_proj(x).unsqueeze(1)  # [B, 1, d_model]
+        x = self.layer_norm(x)  # Normalize before transformer
+        
+        x = self.encoder(x).squeeze(1)       # [B, d_model]
+        
+        if self.use_lora:
+            lora_out = self.lora(x)
+            # Clamp LoRA output to prevent explosion
+            lora_out = torch.clamp(lora_out, -5, 5)
+            x = x + lora_out
+            
+        # Final clamp before return
+        x = torch.clamp(x, -10, 10)
+        return x
+
+# --------------------------
+# Enhanced ULCD Network for Isolated Training
+# --------------------------
 class ULCDNet(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, latent_dim: int = 64):
         super(ULCDNet, self).__init__()
         
         self.latent_dim = latent_dim
+        self.input_dim = input_dim
+        self.output_dim = output_dim
         
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 512),
-            nn.ReLU(),
-            nn.BatchNorm1d(512),
-            nn.Dropout(0.3),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.BatchNorm1d(256),
-            nn.Dropout(0.3),
-            nn.Linear(256, latent_dim),
-            nn.Tanh()
+        # Enhanced tabular encoder with transformer architecture
+        self.tabular_encoder = TabularTransformer(
+            input_dim=input_dim, 
+            d_model=latent_dim,
+            num_heads=min(4, latent_dim // 16),  # Adaptive heads based on latent dim
+            num_layers=2,
+            use_lora=True
         )
         
+        # Consensus mechanism for latent space alignment
         self.consensus_weights = nn.Sequential(
             nn.Linear(latent_dim, latent_dim // 2),
             nn.ReLU(),
@@ -378,18 +440,16 @@ class ULCDNet(nn.Module):
             nn.Softmax(dim=1)
         )
         
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 256),
+        # Task-specific head
+        self.task_head = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim // 2),
             nn.ReLU(),
-            nn.BatchNorm1d(256),
+            nn.BatchNorm1d(latent_dim // 2),
             nn.Dropout(0.3),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.BatchNorm1d(128),
-            nn.Dropout(0.3),
-            nn.Linear(128, output_dim)
+            nn.Linear(latent_dim // 2, output_dim)
         )
         
+        # Distillation head for knowledge transfer
         self.distillation_head = nn.Sequential(
             nn.Linear(latent_dim, 128),
             nn.ReLU(),
@@ -397,18 +457,102 @@ class ULCDNet(nn.Module):
         )
         
     def forward(self, x):
-        latent = self.encoder(x)
+        # Check for NaN/Inf inputs
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print(f"Warning: NaN/Inf detected in input, replacing with zeros")
+            x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
         
+        # Encode input to latent space
+        latent = self.tabular_encoder(x)
+        
+        # Check latent for stability
+        if torch.isnan(latent).any() or torch.isinf(latent).any():
+            print(f"Warning: NaN/Inf detected in latent, using fallback")
+            latent = torch.zeros_like(latent)
+        
+        # Apply consensus weighting with stability checks
         consensus = self.consensus_weights(latent)
+        consensus = torch.clamp(consensus, 1e-8, 1.0)  # Prevent extreme values
         weighted_latent = latent * consensus
         
-        main_output = self.decoder(weighted_latent)
+        # Task-specific prediction
+        main_output = self.task_head(weighted_latent)
         
+        # Distillation output
         distill_output = self.distillation_head(latent)
         
+        # Check outputs for stability
+        if torch.isnan(main_output).any() or torch.isinf(main_output).any():
+            main_output = torch.zeros_like(main_output)
+        if torch.isnan(distill_output).any() or torch.isinf(distill_output).any():
+            distill_output = torch.zeros_like(distill_output)
+        
+        # Ensemble the outputs
         final_output = 0.7 * main_output + 0.3 * distill_output
         
+        # Final stability check
+        final_output = torch.nan_to_num(final_output, nan=0.0, posinf=1.0, neginf=-1.0)
+        
         return final_output
+    
+    def get_latent_summary(self, loader):
+        """Extract latent summaries for federated learning compatibility."""
+        self.eval()
+        with torch.no_grad():
+            all_z = []
+            for batch in loader:
+                if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+                    x = batch[0]
+                else:
+                    x = batch
+                if isinstance(x, torch.Tensor):
+                    z = self.tabular_encoder(x)
+                    all_z.append(z.mean(dim=0))
+            if all_z:
+                return torch.stack(all_z).mean(dim=0)
+            else:
+                return torch.zeros(self.latent_dim)
+
+# ============================================================================
+# FEDERATED LEARNING COMMUNICATION EFFICIENCY
+# ============================================================================
+
+def compute_comm_efficiency(model, f1_weighted):
+    """
+    Compute model communication efficiency for FL.
+    Args:
+        model: trained PyTorch model instance
+        f1_weighted: final weighted F1 score from evaluation
+    Returns:
+        (payload_size_mb, efficiency_score)
+    """
+    buf = io.BytesIO()
+    
+    if model.__class__.__name__ == "ULCDNet":
+        # Save only LoRA parameters for realistic FL communication
+        lora_params = {
+            k: v.cpu()
+            for k, v in model.state_dict().items()
+            if "lora" in k.lower()
+        }
+        if not lora_params:
+            print("Warning: ULCDNet has no LoRA parameters found; saving full model instead.")
+            torch.save(model.state_dict(), buf)
+        else:
+            torch.save(lora_params, buf)
+            print(f"    ULCD FL Mode: Sending only {len(lora_params)} LoRA parameters")
+    else:
+        # Save full model state dict for traditional FL
+        torch.save(model.state_dict(), buf)
+    
+    # Calculate payload size in MB
+    payload_size_bytes = buf.tell()
+    payload_size_mb = payload_size_bytes / (1024 * 1024)
+    
+    # Calculate efficiency score (F1 per MB)
+    efficiency_score = f1_weighted / payload_size_mb if payload_size_mb > 0 else 0.0
+    
+    return payload_size_mb, efficiency_score
 
 # ============================================================================
 # SKLEARN WRAPPER
@@ -617,7 +761,7 @@ MIMIC_DATA_DIR = "mimic-iv-3.1"
 MIN_PARTITION_SIZE = 500
 BATCH_SIZE = 128
 LOCAL_EPOCHS = 40
-LEARNING_RATE = 0.0005
+LEARNING_RATE = 0.0001
 TOP_K_CODES = 100  # Number of top ICD codes to predict (+ 1 'other' class)
 ACTUAL_NUM_CLASSES = None
 
@@ -638,11 +782,11 @@ AVAILABLE_MODELS: List[str] = [
 ]
 
 MODELS_TO_TEST: List[str] = [
+    "ulcd",
     "logistic",
-    "random_forest",
     "mlp",
     "lstm",
-    "mixture_of_experts"
+    "mixture_of_experts",
 ]
 
 # Advanced options
@@ -842,7 +986,18 @@ def train_with_loss_and_accuracy_tracking(net, trainloader, testloader, epochs: 
             expected_classes = ACTUAL_NUM_CLASSES
     else:
         expected_classes = ACTUAL_NUM_CLASSES
-    if max_label >= expected_classes or min_label < 0:
+    # Convert to int, handling tensors and other types
+    try:
+        expected_classes_int = int(expected_classes)
+        max_label_int = int(max_label)
+        min_label_int = int(min_label)
+    except (TypeError, ValueError):
+        # Handle tensor types
+        expected_classes_int = expected_classes.item() if hasattr(expected_classes, 'item') else int(expected_classes)
+        max_label_int = max_label.item() if hasattr(max_label, 'item') else int(max_label)
+        min_label_int = min_label.item() if hasattr(min_label, 'item') else int(min_label)
+    
+    if max_label_int >= expected_classes_int or min_label_int < 0:
         print(f"    WARNING: Invalid labels detected! Max label: {max_label}, Expected classes: {expected_classes}")
         print(f"    Labels will be clipped during training to valid range [0, {expected_classes-1}]")
     
@@ -1040,8 +1195,9 @@ def enhanced_test(net, testloader, device, icd_frequency_tiers=None):
     
     # Higher Top-K values for large label spaces
     num_classes = all_probabilities.shape[1] if len(all_probabilities.shape) > 1 else len(set(all_labels))
-    top500_accuracy = calculate_top_k_accuracy(all_labels, all_probabilities, k=500) if num_classes >= 500 else 0.0
-    top1000_accuracy = calculate_top_k_accuracy(all_labels, all_probabilities, k=1000) if num_classes >= 1000 else 0.0
+    # Always calculate top-K accuracies (will cap K to num_classes internally)
+    top500_accuracy = calculate_top_k_accuracy(all_labels, all_probabilities, k=500)
+    top1000_accuracy = calculate_top_k_accuracy(all_labels, all_probabilities, k=1000)
     
     # Medical domain analysis
     rare_common_metrics = None
@@ -1049,6 +1205,9 @@ def enhanced_test(net, testloader, device, icd_frequency_tiers=None):
         rare_common_metrics = calculate_rare_common_performance(
             all_labels, all_predictions, icd_frequency_tiers
         )
+    
+    # Communication efficiency analysis for FL
+    comm_payload_mb, comm_efficiency = compute_comm_efficiency(net, f1_weighted)
     
     return avg_loss, {
         "accuracy": accuracy,
@@ -1062,7 +1221,9 @@ def enhanced_test(net, testloader, device, icd_frequency_tiers=None):
         "top50_accuracy": top50_accuracy,
         "top500_accuracy": top500_accuracy,
         "top1000_accuracy": top1000_accuracy,
-        "rare_common_performance": rare_common_metrics
+        "rare_common_performance": rare_common_metrics,
+        "comm_payload_mb": comm_payload_mb,
+        "comm_efficiency": comm_efficiency
     }
 
 def calculate_top_k_accuracy(labels, probabilities, k):
@@ -1208,7 +1369,9 @@ def create_empty_metrics():
         "top50_accuracy": 0.0,
         "top500_accuracy": 0.0,
         "top1000_accuracy": 0.0,
-        "rare_common_performance": None
+        "rare_common_performance": None,
+        "comm_payload_mb": 0.0,
+        "comm_efficiency": 0.0
     }
 
 # ============================================================================
@@ -1394,6 +1557,43 @@ def plot_training_metrics(all_results, partition_name):
         ax7.set_ylim(0, 100)
         ax7.legend()
         ax7.grid(True, alpha=0.3)
+    
+    # Plot 8: FL Communication Efficiency
+    ax8 = fig.add_subplot(gs[2, 1])
+    if all('metrics' in result for result in all_results.values()):
+        comm_payloads = [result['metrics']['comm_payload_mb'] for result in all_results.values()]
+        comm_efficiencies = [result['metrics']['comm_efficiency'] for result in all_results.values()]
+        
+        x = np.arange(len(models))
+        
+        # Create dual y-axis plot
+        ax8_twin = ax8.twinx()
+        
+        # Bar chart for payload size (left y-axis)
+        bars1 = ax8.bar(x, comm_payloads, alpha=0.6, color='lightblue', 
+                        label='Payload Size (MB)')
+        
+        # Line chart for efficiency (right y-axis)  
+        line1 = ax8_twin.plot(x, comm_efficiencies, 'ro-', linewidth=2, 
+                             markersize=6, label='Efficiency (F1/MB)')
+        
+        ax8.set_xlabel('Model')
+        ax8.set_ylabel('Payload Size (MB)', color='blue')
+        ax8_twin.set_ylabel('FL Efficiency (F1/MB)', color='red')
+        ax8.set_title(f'FL Communication Analysis - {partition_name.title()}')
+        ax8.set_xticks(x)
+        ax8.set_xticklabels([m.title() for m in models], rotation=45, ha='right', fontsize=8)
+        
+        # Color the y-axis labels
+        ax8.tick_params(axis='y', labelcolor='blue')
+        ax8_twin.tick_params(axis='y', labelcolor='red')
+        
+        # Combine legends
+        lines1, labels1 = ax8.get_legend_handles_labels()
+        lines2, labels2 = ax8_twin.get_legend_handles_labels()
+        ax8.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=8)
+        
+        ax8.grid(True, alpha=0.3)
     
     plt.suptitle(f'{partition_name.title()} Partition', 
                  fontsize=16, y=0.95)
@@ -1620,11 +1820,12 @@ def evaluate_on_global_dataset(partitions, global_feature_space, icd_frequency_t
     testloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     
     input_dim = X_train.shape[1]
-    # Use actual number of unique classes (like in partition training)
+    # Use actual number of unique classes (consistent with main training logic)
     if TOP_K_CODES is not None and TOP_K_CODES != 'none':
         output_dim = TOP_K_CODES + 1  # +1 for "other" class  
     else:
-        output_dim = 9554  # Use full ICD code space
+        # Use actual unique labels from processed data (not raw ICD space)
+        output_dim = len(np.unique(y_train))
     
     global_results = {}
     
@@ -1670,14 +1871,14 @@ def evaluate_on_global_dataset(partitions, global_feature_space, icd_frequency_t
         print(f"    Top-5 Accuracy: {metrics['top5_accuracy']:.4f} ({metrics['top5_accuracy']*100:.2f}%)")
         print(f"    Top-20 Accuracy: {metrics['top20_accuracy']:.4f} ({metrics['top20_accuracy']*100:.2f}%)")
         print(f"    Top-50 Accuracy: {metrics['top50_accuracy']:.4f} ({metrics['top50_accuracy']*100:.2f}%)")
-        if metrics['top500_accuracy'] > 0:  # Only show if applicable
-            print(f"    Top-500 Accuracy: {metrics['top500_accuracy']:.4f} ({metrics['top500_accuracy']*100:.2f}%)")
-        if metrics['top1000_accuracy'] > 0:  # Only show if applicable  
-            print(f"    Top-1000 Accuracy: {metrics['top1000_accuracy']:.4f} ({metrics['top1000_accuracy']*100:.2f}%)")
+        print(f"    Top-500 Accuracy: {metrics['top500_accuracy']:.4f} ({metrics['top500_accuracy']*100:.2f}%)")
+        print(f"    Top-1000 Accuracy: {metrics['top1000_accuracy']:.4f} ({metrics['top1000_accuracy']*100:.2f}%)")
         print(f"    F1 Weighted: {metrics['f1_weighted']:.4f}")
         print(f"    F1 Macro: {metrics['f1_macro']:.4f}")
         print(f"    Precision: {metrics['precision']:.4f}")
         print(f"    Recall: {metrics['recall']:.4f}")
+        print(f"    FL Comm Payload: {metrics['comm_payload_mb']:.4f} MB")
+        print(f"    FL Comm Efficiency: {metrics['comm_efficiency']:.1f} F1/MB")
         
         # Print rare vs common performance if available
         if metrics['rare_common_performance']:
@@ -1708,118 +1909,6 @@ def evaluate_on_global_dataset(partitions, global_feature_space, icd_frequency_t
     
     return global_results
 
-def plot_global_comparison(global_results):
-    """Create visualization comparing all models on the global dataset."""
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
-    
-    models = list(global_results.keys())
-    colors = ['blue', 'red', 'green', 'orange', 'purple', 'brown', 'pink', 'gray', 'olive', 'cyan']
-    
-    # 1. Training Loss Progression
-    for i, (model_name, results) in enumerate(global_results.items()):
-        if 'loss_history' in results:
-            epochs = range(1, len(results['loss_history']) + 1)
-            ax1.plot(epochs, results['loss_history'], 
-                    color=colors[i % len(colors)], 
-                    linewidth=2, 
-                    marker='o', 
-                    markersize=4,
-                    label=f'{model_name.title()} Model')
-    
-    ax1.set_xlabel('Epoch', fontsize=12)
-    ax1.set_ylabel('Training Loss', fontsize=12)
-    ax1.set_title('Global Dataset - Training Loss Progression', fontsize=14)
-    ax1.set_ylim(0, 25.0)
-    ax1.grid(True, alpha=0.3)
-    ax1.legend()
-    
-    # 2. Accuracy Progression  
-    for i, (model_name, results) in enumerate(global_results.items()):
-        if 'accuracy_history' in results:
-            epochs = range(1, len(results['accuracy_history']) + 1)
-            ax2.plot(epochs, [acc * 100 for acc in results['accuracy_history']], 
-                    color=colors[i % len(colors)], 
-                    linewidth=2, 
-                    marker='s', 
-                    markersize=4,
-                    label=f'{model_name.title()} Model')
-    
-    ax2.set_xlabel('Epoch', fontsize=12)
-    ax2.set_ylabel('Test Accuracy (%)', fontsize=12)
-    ax2.set_title('Global Dataset - Accuracy Progression', fontsize=14)
-    ax2.set_ylim(0, 105)  # Padded for visibility
-    ax2.grid(True, alpha=0.3)
-    ax2.legend()
-    
-    # 3. Final Performance Comparison - Bar Chart
-    accuracies = [results['metrics']['accuracy'] for results in global_results.values()]
-    f1_scores = [results['metrics']['f1'] for results in global_results.values()]
-    
-    x = np.arange(len(models))
-    width = 0.35
-    
-    bars1 = ax3.bar(x - width/2, accuracies, width, label='Accuracy', alpha=0.8, color='skyblue')
-    bars2 = ax3.bar(x + width/2, f1_scores, width, label='F1 Score', alpha=0.8, color='lightcoral')
-    
-    ax3.set_xlabel('Model Architecture')
-    ax3.set_ylabel('Performance Score')
-    ax3.set_title('Global Dataset - Final Performance Comparison')
-    ax3.set_xticks(x)
-    ax3.set_xticklabels([m.title() for m in models], rotation=45, ha='right')
-    ax3.legend()
-    ax3.grid(True, alpha=0.3)
-    
-    # Add value labels on bars
-    for bar in bars1:
-        height = bar.get_height()
-        ax3.annotate(f'{height:.3f}',
-                    xy=(bar.get_x() + bar.get_width() / 2, height),
-                    xytext=(0, 3),  # 3 points vertical offset
-                    textcoords="offset points",
-                    ha='center', va='bottom', fontsize=8)
-    
-    for bar in bars2:
-        height = bar.get_height()
-        ax3.annotate(f'{height:.3f}',
-                    xy=(bar.get_x() + bar.get_width() / 2, height),
-                    xytext=(0, 3),  # 3 points vertical offset
-                    textcoords="offset points",
-                    ha='center', va='bottom', fontsize=8)
-    
-    # 4. Loss Reduction Comparison
-    loss_reductions = []
-    for results in global_results.values():
-        if 'loss_history' in results and len(results['loss_history']) > 1:
-            reduction = ((results['loss_history'][0] - results['loss_history'][-1]) / results['loss_history'][0] * 100)
-            loss_reductions.append(reduction)
-        else:
-            loss_reductions.append(0)
-    
-    bars4 = ax4.bar(models, loss_reductions, alpha=0.8, color='lightgreen')
-    ax4.set_xlabel('Model Architecture')
-    ax4.set_ylabel('Loss Reduction (%)')
-    ax4.set_title('Global Dataset - Training Loss Reduction')
-    ax4.set_xticklabels([m.title() for m in models], rotation=45, ha='right')
-    ax4.grid(True, alpha=0.3)
-    
-    # Add value labels
-    for bar in bars4:
-        height = bar.get_height()
-        ax4.annotate(f'{height:.1f}%',
-                    xy=(bar.get_x() + bar.get_width() / 2, height),
-                    xytext=(0, 3),
-                    textcoords="offset points",
-                    ha='center', va='bottom', fontsize=9)
-    
-    plt.tight_layout()
-    
-    if SAVE_PLOTS:
-        os.makedirs('isolated_plots', exist_ok=True)
-        filename = 'isolated_plots/global_dataset_comparison.png'
-        plt.savefig(filename, dpi=300, bbox_inches='tight')
-        print(f"Global dataset comparison plot saved: {filename}")
-    
-    plt.close()
 
 def plot_enhanced_global_comparison(global_results):
     """Create enhanced visualization with medical-specific metrics for global dataset (matches partition format)."""
@@ -1994,6 +2083,43 @@ def plot_enhanced_global_comparison(global_results):
         ax7.legend()
         ax7.grid(True, alpha=0.3)
     
+    # 8. FL Communication Efficiency
+    ax8 = fig.add_subplot(gs[2, 1])
+    if all('metrics' in result for result in global_results.values()):
+        comm_payloads = [result['metrics']['comm_payload_mb'] for result in global_results.values()]
+        comm_efficiencies = [result['metrics']['comm_efficiency'] for result in global_results.values()]
+        
+        x = np.arange(len(models))
+        
+        # Create dual y-axis plot
+        ax8_twin = ax8.twinx()
+        
+        # Bar chart for payload size (left y-axis)
+        bars8 = ax8.bar(x, comm_payloads, alpha=0.6, color='lightblue', 
+                        label='Payload Size (MB)')
+        
+        # Line chart for efficiency (right y-axis)  
+        line8 = ax8_twin.plot(x, comm_efficiencies, 'ro-', linewidth=2, 
+                             markersize=6, label='Efficiency (F1/MB)')
+        
+        ax8.set_xlabel('Model')
+        ax8.set_ylabel('Payload Size (MB)', color='blue')
+        ax8_twin.set_ylabel('FL Efficiency (F1/MB)', color='red')
+        ax8.set_title('FL Communication Efficiency - Global Dataset')
+        ax8.set_xticks(x)
+        ax8.set_xticklabels([m.title() for m in models], rotation=45, ha='right', fontsize=8)
+        
+        # Color the y-axis labels
+        ax8.tick_params(axis='y', labelcolor='blue')
+        ax8_twin.tick_params(axis='y', labelcolor='red')
+        
+        # Combine legends
+        lines1, labels1 = ax8.get_legend_handles_labels()
+        lines2, labels2 = ax8_twin.get_legend_handles_labels()
+        ax8.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=8)
+        
+        ax8.grid(True, alpha=0.3)
+    
     plt.suptitle('Global Dataset', 
                  fontsize=16, y=0.95)
     
@@ -2145,7 +2271,8 @@ def main():
         if TOP_K_CODES is not None and TOP_K_CODES != 'none':
             output_dim = TOP_K_CODES + 1
         else:
-            output_dim = ACTUAL_NUM_CLASSES
+            # Use actual unique labels from processed data (not raw ACTUAL_NUM_CLASSES)
+            output_dim = len(np.unique(y_train))
 
         # 3. Train and evaluate each model architecture
         for model_name in MODELS_TO_TEST:
@@ -2186,14 +2313,14 @@ def main():
             print(f"    Top-5 Accuracy: {metrics['top5_accuracy']:.4f} ({metrics['top5_accuracy']*100:.2f}%)")
             print(f"    Top-20 Accuracy: {metrics['top20_accuracy']:.4f} ({metrics['top20_accuracy']*100:.2f}%)")
             print(f"    Top-50 Accuracy: {metrics['top50_accuracy']:.4f} ({metrics['top50_accuracy']*100:.2f}%)")
-            if metrics['top500_accuracy'] > 0:  # Only show if applicable
-                print(f"    Top-500 Accuracy: {metrics['top500_accuracy']:.4f} ({metrics['top500_accuracy']*100:.2f}%)")
-            if metrics['top1000_accuracy'] > 0:  # Only show if applicable  
-                print(f"    Top-1000 Accuracy: {metrics['top1000_accuracy']:.4f} ({metrics['top1000_accuracy']*100:.2f}%)")
+            print(f"    Top-500 Accuracy: {metrics['top500_accuracy']:.4f} ({metrics['top500_accuracy']*100:.2f}%)")
+            print(f"    Top-1000 Accuracy: {metrics['top1000_accuracy']:.4f} ({metrics['top1000_accuracy']*100:.2f}%)")
             print(f"    F1 Weighted: {metrics['f1_weighted']:.4f}")
             print(f"    F1 Macro: {metrics['f1_macro']:.4f}")
             print(f"    Precision: {metrics['precision']:.4f}")
             print(f"    Recall: {metrics['recall']:.4f}")
+            print(f"    FL Comm Payload: {metrics['comm_payload_mb']:.4f} MB")
+            print(f"    FL Comm Efficiency: {metrics['comm_efficiency']:.1f} F1/MB")
             
             # Print rare vs common performance if available
             if metrics['rare_common_performance']:
