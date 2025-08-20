@@ -6,8 +6,6 @@ mimic-iv-3.1/
 isolated_plots/
 
 # Feature caches (centralized)
-feature_cache/
-*.pkl
 
 # Python
 __pycache__/
