@@ -18,6 +18,10 @@ from torch.utils.data import DataLoader
 # Aggregates evaluation metrics using weighted average
 def weighted_average(metrics):
     try:
+        # Force memory cleanup before aggregation
+        import gc
+        gc.collect()
+        
         print(f"Aggregating metrics from {len(metrics)} clients...")
         
         total_examples = sum([num_examples for num_examples, _ in metrics])
@@ -33,6 +37,9 @@ def weighted_average(metrics):
                 weighted_metrics[key] = weighted_sum / total_examples
                 print(f"Weighted {key}: {weighted_metrics[key]:.4f}")
         
+        # Force cleanup after aggregation
+        gc.collect()
+        
         return weighted_metrics
         
     except Exception as e:
@@ -42,6 +49,10 @@ def weighted_average(metrics):
 # Aggregates fit metrics using weighted average
 def weighted_average_fit(fit_metrics):
     try:
+        # Force memory cleanup before aggregation
+        import gc
+        gc.collect()
+        
         print(f"Aggregating fit metrics from {len(fit_metrics)} clients...")
         
         total_examples = sum([num_examples for num_examples, _ in fit_metrics])

@@ -18,7 +18,7 @@ from flwr.common import parameters_to_ndarrays
 from torch.nn import functional as F
 
 # Import separated components
-from .models import MimicDataset, Net, AdvancedNet, get_model, FocalLoss
+from .models import MimicDataset, Net, AdvancedNet, get_model, FocalLoss, is_sklearn_model, get_model_type, SklearnWrapper
 from .partitioning import create_heterogeneous_partitions, create_balanced_partitions
 from .data_utils import (
     ICD9_CHAPTERS, ICD10_CHAPTERS, ALL_CHAPTERS, CHAPTER_TO_INDEX, INDEX_TO_CHAPTER,
@@ -124,7 +124,7 @@ def get_global_feature_space(data_dir: str = "mimic-iv-3.1") -> Dict[str, List[s
 
 # Creates feature matrix and labels for ICD code prediction
 # Creates feature matrix and labels from medical data
-def create_features_and_labels(df: pd.DataFrame, partition_chapter: str, global_feature_space: Dict[str, List[str]] = None, top_n_cat: int = 10, include_icd_features: bool = True) -> Tuple[pd.DataFrame, pd.Series]:
+def create_features_and_labels(df: pd.DataFrame, partition_chapter: str, global_feature_space: Dict[str, List[str]] = None, top_n_cat: int = 10, include_icd_features: bool = True, quiet_mode: bool = False) -> Tuple[pd.DataFrame, pd.Series]:
     try:
         # Create labels: map ICD codes to global top K indices, or use -1 for "other"
         labels = []
@@ -160,9 +160,10 @@ def create_features_and_labels(df: pd.DataFrame, partition_chapter: str, global_
         unique_top_k = len(set([label for label in labels if label < len(TOP_ICD_CODES)]))
         
         feature_mode = "with ICD features" if include_icd_features else "without ICD features (validation mode)"
-        print(f"Chapter '{partition_chapter}': {len(labels)} samples total ({feature_mode})")
-        print(f"  - {top_k_count} samples from {unique_top_k} top-{len(TOP_ICD_CODES)} ICD codes")
-        print(f"  - {other_count} samples from other ICD codes (labeled as 'other')")
+        if not quiet_mode:
+            print(f"Chapter '{partition_chapter}': {len(labels)} samples total ({feature_mode})")
+            print(f"  - {top_k_count} samples from {unique_top_k} top-{len(TOP_ICD_CODES)} ICD codes")
+            print(f"  - {other_count} samples from other ICD codes (labeled as 'other')")
         
         # CRITICAL: Warn if client has no top-K codes (will only learn "other")
         if unique_top_k == 0:
@@ -212,7 +213,8 @@ def create_features_and_labels(df: pd.DataFrame, partition_chapter: str, global_
                     dummies = pd.get_dummies(col_modified, prefix=feature, dummy_na=False)
                 
                 features_list.append(dummies)
-                print(f"Added demographic feature '{feature}' with {len(dummies.columns)} categories")
+                if not quiet_mode:
+                    print(f"Added demographic feature '{feature}' with {len(dummies.columns)} categories")
                 
             except Exception as e:
                 print(f"Error processing demographic column '{feature}': {e}")
@@ -224,13 +226,15 @@ def create_features_and_labels(df: pd.DataFrame, partition_chapter: str, global_
         for col in numerical_features:
             if col in df_filtered.columns:
                 demo_numerical[col] = df_filtered[col].fillna(df_filtered[col].median())
-                print(f"Added numerical demographic feature '{col}'")
+                if not quiet_mode:
+                    print(f"Added numerical demographic feature '{col}'")
         
         if len(demo_numerical.columns) > 0:
             features_list.append(demo_numerical)
         
         # Temporal features - admission timing and duration patterns
-        print("Extracting temporal features...")
+        if not quiet_mode:
+            print("Extracting temporal features...")
         temporal_features = pd.DataFrame(index=df_filtered.index)
         
         if 'admittime' in df_filtered.columns and 'dischtime' in df_filtered.columns:
@@ -272,7 +276,8 @@ def create_features_and_labels(df: pd.DataFrame, partition_chapter: str, global_
                 temporal_features['night_discharge'] = ((df_filtered['dischtime'].dt.hour >= 22) | 
                                                         (df_filtered['dischtime'].dt.hour < 6)).astype(int)
             
-            print(f"Added {len(temporal_features.columns)} temporal features")
+            if not quiet_mode:
+                print(f"Added {len(temporal_features.columns)} temporal features")
         else:
             print("Admission/discharge time not available, using basic temporal features")
             # Basic fallback features
@@ -285,17 +290,19 @@ def create_features_and_labels(df: pd.DataFrame, partition_chapter: str, global_
             features_list.append(temporal_features)
         
         # Medical features - conditional based on mode
-        print(f"Extracting medical features (include_icd_features={include_icd_features})...")
+        if not quiet_mode:
+            print(f"Extracting medical features (include_icd_features={include_icd_features})...")
         
         hadm_ids = df_filtered['hadm_id'].tolist()
-        medical_features = get_medical_features_for_admissions(hadm_ids, data_dir="mimic-iv-3.1", include_icd_features=include_icd_features)
+        medical_features = get_medical_features_for_admissions(hadm_ids, data_dir="mimic-iv-3.1", include_icd_features=include_icd_features, quiet_mode=quiet_mode)
         
         if not medical_features.empty:
             # CRITICAL: Ensure alignment by hadm_id
             medical_features_aligned = medical_features.reindex(hadm_ids, fill_value=0)
             medical_features_aligned.index = df_filtered.index  # Align with main dataframe
             features_list.append(medical_features_aligned)
-            print(f"Added {len(medical_features_aligned.columns)} medical features (aligned by hadm_id)")
+            if not quiet_mode:
+                print(f"Added {len(medical_features_aligned.columns)} medical features (aligned by hadm_id)")
         else:
             print("No medical features extracted")
         
@@ -308,8 +315,9 @@ def create_features_and_labels(df: pd.DataFrame, partition_chapter: str, global_
         
         features = features.fillna(0)
         
-        print(f"Final feature shape (demographics + medical): {features.shape}")
-        print(f"Feature categories: Demographics + Medical")
+        if not quiet_mode:
+            print(f"Final feature shape (demographics + medical): {features.shape}")
+            print(f"Feature categories: Demographics + Medical")
         return features, labels
     
     except Exception as e:
@@ -319,26 +327,34 @@ def create_features_and_labels(df: pd.DataFrame, partition_chapter: str, global_
         return dummy_features, dummy_labels
 
 # Loads and preprocesses data for a specific partition
+# Global variable to store partitions for distributed mode
+GLOBAL_PARTITIONS = None
+
 # ============================================================================
 # DATA LOADING
 # ============================================================================
 # Loads partition data and creates PyTorch dataloaders
-def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1", min_partition_size: int = 1000, partition_scheme: str = "heterogeneous", top_k_codes: int = 75, cached_partitions: Dict = None, precomputed_icd_data: Dict = None):
+def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1", min_partition_size: int = 1000, partition_scheme: str = "heterogeneous", top_k_codes: int = 75, cached_partitions: Dict = None, precomputed_icd_data: Dict = None, quiet_mode: bool = False):
     try:
+        global GLOBAL_PARTITIONS
+        
         if cached_partitions is not None:
-            # Use pre-computed partitions to avoid recomputing
+            # Use pre-computed partitions to avoid recomputing (local mode)
             valid_partitions = cached_partitions
-            
-            # Initialize TOP_ICD_CODES from precomputed data if available
-            global TOP_ICD_CODES, ICD_CODE_TO_INDEX, INDEX_TO_ICD_CODE
-            if precomputed_icd_data and len(TOP_ICD_CODES) == 0:
-                TOP_ICD_CODES.extend(precomputed_icd_data.get("top_icd_codes_list", []))
-                ICD_CODE_TO_INDEX.update(precomputed_icd_data.get("icd_code_to_index", {}))
-                INDEX_TO_ICD_CODE.update(precomputed_icd_data.get("index_to_icd_code", {}))
+        elif GLOBAL_PARTITIONS is not None:
+            # Use global partitions for distributed mode
+            valid_partitions = GLOBAL_PARTITIONS
         else:
             # Fallback to computing partitions (for backward compatibility)
             partitions = load_and_partition_data(data_dir, min_partition_size, partition_scheme, top_k_codes)
             valid_partitions = {ch: df for ch, df in partitions.items() if len(df) >= 20}
+        
+        # Initialize TOP_ICD_CODES from precomputed data if available
+        global TOP_ICD_CODES, ICD_CODE_TO_INDEX, INDEX_TO_ICD_CODE
+        if precomputed_icd_data and len(TOP_ICD_CODES) == 0:
+            TOP_ICD_CODES.extend(precomputed_icd_data.get("top_icd_codes_list", []))
+            ICD_CODE_TO_INDEX.update(precomputed_icd_data.get("icd_code_to_index", {}))
+            INDEX_TO_ICD_CODE.update(precomputed_icd_data.get("index_to_icd_code", {}))
         
         global_feature_space = get_global_feature_space(data_dir)
         
@@ -354,7 +370,7 @@ def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1"
         
         # Training data: Use ONLY non-ICD features for fair evaluation
         train_features, train_labels = create_features_and_labels(
-            partition_data, partition_name, global_feature_space, include_icd_features=False
+            partition_data, partition_name, global_feature_space, include_icd_features=False, quiet_mode=quiet_mode
         )
         
         # Evaluation data: Create balanced test set from all partitions
@@ -368,7 +384,7 @@ def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1"
             if len(chapter_data) >= samples_per_chapter:
                 sampled_data = chapter_data.sample(n=samples_per_chapter, random_state=42)
                 chapter_features, chapter_labels = create_features_and_labels(
-                    sampled_data, chapter_name, global_feature_space, include_icd_features=False
+                    sampled_data, chapter_name, global_feature_space, include_icd_features=False, quiet_mode=quiet_mode
                 )
                 eval_features_list.append(chapter_features)
                 eval_labels_list.append(chapter_labels)
@@ -390,7 +406,7 @@ def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1"
                 for chapter_name, chapter_data in valid_partitions.items():
                     # Get labels for this chapter
                     _, chapter_labels = create_features_and_labels(
-                        chapter_data, chapter_name, global_feature_space, include_icd_features=False
+                        chapter_data, chapter_name, global_feature_space, include_icd_features=False, quiet_mode=quiet_mode
                     )
                     
                     # Find samples with top-K codes
@@ -402,7 +418,7 @@ def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1"
                         extra_samples = min(25, len(top_k_samples))
                         sampled_top_k = top_k_samples.sample(n=extra_samples, random_state=42)
                         extra_features, extra_labels = create_features_and_labels(
-                            sampled_top_k, chapter_name, global_feature_space, include_icd_features=False
+                            sampled_top_k, chapter_name, global_feature_space, include_icd_features=False, quiet_mode=quiet_mode
                         )
                         additional_features.append(extra_features)
                         additional_labels.append(extra_labels)
@@ -436,8 +452,9 @@ def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1"
         X_eval = eval_features.values.astype(np.float32)
         y_eval = eval_labels.values.astype(np.int64)
         
-        print(f"Training data shape: X={X_train.shape}, y={y_train.shape}")
-        print(f"Evaluation data shape: X={X_eval.shape}, y={y_eval.shape}")
+        if not quiet_mode:
+            print(f"Training data shape: X={X_train.shape}, y={y_train.shape}")
+            print(f"Evaluation data shape: X={X_eval.shape}, y={y_eval.shape}")
         
         # Analyze class distribution in detail
         train_top_k_count = sum(1 for label in y_train if label < len(TOP_ICD_CODES))
@@ -445,13 +462,14 @@ def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1"
         eval_top_k_count = sum(1 for label in y_eval if label < len(TOP_ICD_CODES))
         eval_other_count = len(y_eval) - eval_top_k_count
         
-        print(f"Training distribution:")
-        print(f"  Top-K codes: {train_top_k_count} ({train_top_k_count/len(y_train)*100:.1f}%)")
-        print(f"  Other codes: {train_other_count} ({train_other_count/len(y_train)*100:.1f}%)")
-        
-        print(f"Evaluation distribution:")
-        print(f"  Top-K codes: {eval_top_k_count} ({eval_top_k_count/len(y_eval)*100:.1f}%)")
-        print(f"  Other codes: {eval_other_count} ({eval_other_count/len(y_eval)*100:.1f}%)")
+        if not quiet_mode:
+            print(f"Training distribution:")
+            print(f"  Top-K codes: {train_top_k_count} ({train_top_k_count/len(y_train)*100:.1f}%)")
+            print(f"  Other codes: {train_other_count} ({train_other_count/len(y_train)*100:.1f}%)")
+            
+            print(f"Evaluation distribution:")
+            print(f"  Top-K codes: {eval_top_k_count} ({eval_top_k_count/len(y_eval)*100:.1f}%)")
+            print(f"  Other codes: {eval_other_count} ({eval_other_count/len(y_eval)*100:.1f}%)")
         
         # Warning if evaluation data is too imbalanced
         if eval_top_k_count / len(y_eval) < 0.2:
@@ -459,7 +477,8 @@ def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1"
         elif eval_top_k_count / len(y_eval) > 0.8:
             print(f"WARNING: Evaluation data has >80% top-K codes - may be too easy!")
         else:
-            print(f"GOOD: Evaluation data has reasonable class balance")
+            if not quiet_mode:
+                print(f"GOOD: Evaluation data has reasonable class balance")
         
         train_dataset = MimicDataset(X_train, y_train)
         eval_dataset = MimicDataset(X_eval, y_eval)
@@ -470,9 +489,10 @@ def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1"
         input_dim = X_train.shape[1]
         output_dim = top_k_codes + 1  # +1 for "other" class
         
-        print(f"[CLIENT {partition_id}] Created dataloaders: train_size={len(train_dataset)}, test_size={len(eval_dataset)}")
-        print(f"[CLIENT {partition_id}] Model dimensions: input={input_dim}, output={output_dim} (top-{top_k_codes} + other)")
-        print(f"[CLIENT {partition_id}] Data loading completed successfully")
+        if not quiet_mode:
+            print(f"[CLIENT {partition_id}] Created dataloaders: train_size={len(train_dataset)}, test_size={len(eval_dataset)}")
+            print(f"[CLIENT {partition_id}] Model dimensions: input={input_dim}, output={output_dim} (top-{top_k_codes} + other)")
+            print(f"[CLIENT {partition_id}] Data loading completed successfully")
         
         return trainloader, testloader, input_dim, output_dim
         
@@ -519,6 +539,10 @@ def create_partition_dataloaders(data, mlb, all_feature_cols, partition_id, part
 # ============================================================================
 # Trains model with FedProx regularization
 def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, device, use_focal_loss=False):
+    # Handle sklearn models differently
+    if is_sklearn_model(net):
+        return train_sklearn_model(net, trainloader)
+    
     # Calculate class weights from this client's data
     all_labels = []
     for _, labels in trainloader:
@@ -537,10 +561,19 @@ def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, devi
         # Use weighted cross entropy
         criterion = nn.CrossEntropyLoss(weight=class_weights)
     
-    # Use SGD with momentum for more stable federated training
-    optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-4)
-    # Add learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=learning_rate*0.1)
+    # Use different optimizers based on model type
+    model_type = get_model_type(net)
+    if model_type == "ulcd":
+        # Use AdamW for ULCD (better for transformers)
+        optimizer = torch.optim.AdamW(net.parameters(), lr=learning_rate, weight_decay=0.01)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=3
+        )
+    else:
+        # Use SGD with momentum for other models
+        optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=learning_rate*0.1)
+    
     net.to(device)
     global_net.to(device)
     net.train()
@@ -549,6 +582,9 @@ def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, devi
     num_batches = 0
     
     for epoch in range(epochs):
+        epoch_loss = 0
+        epoch_batches = 0
+        
         for features, labels in trainloader:
             features, labels = features.to(device), labels.to(device)
             optimizer.zero_grad()
@@ -570,13 +606,37 @@ def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, devi
             optimizer.step()
             
             total_loss += loss.item()
+            epoch_loss += loss.item()
             num_batches += 1
+            epoch_batches += 1
         
-        # Update learning rate after each epoch
-        scheduler.step()
+        # Update learning rate
+        if model_type == "ulcd":
+            scheduler.step(epoch_loss / epoch_batches if epoch_batches > 0 else 0)
+        else:
+            scheduler.step()
     
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     return avg_loss
+
+def train_sklearn_model(net, trainloader):
+    """Special training function for sklearn models"""
+    # Collect all training data
+    all_features = []
+    all_labels = []
+    
+    for features, labels in trainloader:
+        all_features.append(features.numpy())
+        all_labels.append(labels.numpy())
+    
+    X = np.vstack(all_features)
+    y = np.concatenate(all_labels)
+    
+    # Train the sklearn model
+    net.fit_sklearn(X, y)
+    
+    # Return a dummy loss (sklearn doesn't provide incremental loss)
+    return 0.1
 
 # Displays comprehensive prediction analysis with class distribution
 # Displays detailed prediction analysis
@@ -676,6 +736,12 @@ def display_prediction_analysis(all_predictions, all_labels):
 # Tests model and returns loss and metrics
 def test(net, testloader, device):
     try:
+        # Force memory cleanup before testing
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         criterion = nn.CrossEntropyLoss()
         net.to(device)
         net.eval()
@@ -694,17 +760,49 @@ def test(net, testloader, device):
         
         with torch.no_grad():
             for batch_idx, (features, labels) in enumerate(testloader):
-                features, labels = features.to(device), labels.to(device)
-                outputs = net(features)
-                loss = criterion(outputs, labels)
-                total_loss += loss.item()
+                # Process smaller batches to reduce memory pressure
+                batch_size = features.size(0)
+                if batch_size > 32:  # Split large batches
+                    mid = batch_size // 2
+                    features1, labels1 = features[:mid].to(device), labels[:mid].to(device)
+                    features2, labels2 = features[mid:].to(device), labels[mid:].to(device)
+                    
+                    outputs1 = net(features1)
+                    outputs2 = net(features2)
+                    loss1 = criterion(outputs1, labels1)
+                    loss2 = criterion(outputs2, labels2)
+                    
+                    total_loss += (loss1.item() + loss2.item()) / 2
+                    
+                    _, predicted1 = torch.max(outputs1.data, 1)
+                    _, predicted2 = torch.max(outputs2.data, 1)
+                    
+                    all_labels.extend(labels1.cpu().numpy())
+                    all_labels.extend(labels2.cpu().numpy())
+                    all_predictions.extend(predicted1.cpu().numpy())
+                    all_predictions.extend(predicted2.cpu().numpy())
+                    
+                    # Clear intermediate tensors
+                    del features1, labels1, features2, labels2, outputs1, outputs2
+                else:
+                    features, labels = features.to(device), labels.to(device)
+                    outputs = net(features)
+                    loss = criterion(outputs, labels)
+                    total_loss += loss.item()
+                    
+                    _, predicted = torch.max(outputs.data, 1)
+                    all_labels.extend(labels.cpu().numpy())
+                    all_predictions.extend(predicted.cpu().numpy())
                 
-                _, preds = torch.max(outputs, 1)
-                all_labels.append(labels.cpu().numpy())
-                all_predictions.append(preds.cpu().numpy())
-
-        all_labels = np.concatenate(all_labels)
-        all_predictions = np.concatenate(all_predictions)
+                # Force cleanup after each batch for memory efficiency
+                if batch_idx % 10 == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+        
+        # Convert lists to numpy arrays
+        all_labels = np.array(all_labels)
+        all_predictions = np.array(all_predictions)
         
         avg_loss = total_loss / len(testloader)
         accuracy = accuracy_score(all_labels, all_predictions)
@@ -737,14 +835,55 @@ def test(net, testloader, device):
 # ============================================================================
 # Extracts model weights as numpy arrays
 def get_weights(net: torch.nn.Module):
-    return [val.cpu().numpy() for _, val in net.state_dict().items()]
+    """Get model weights, with special handling for different model types"""
+    if is_sklearn_model(net):
+        # For sklearn models, we can't really aggregate weights in the traditional sense
+        # Return dummy weights
+        return [np.array([0.0])]
+    
+    model_type = get_model_type(net)
+    if model_type == "ulcd":
+        # For ULCD, only return LoRA parameters for FL communication efficiency
+        lora_params = {
+            k: v.cpu().numpy()
+            for k, v in net.state_dict().items()
+            if "lora" in k.lower()
+        }
+        if lora_params:
+            return list(lora_params.values())
+        else:
+            # Fallback to full model if no LoRA params found
+            return [val.cpu().numpy() for _, val in net.state_dict().items()]
+    else:
+        # Standard neural networks - return all parameters
+        return [val.cpu().numpy() for _, val in net.state_dict().items()]
 
 # Sets model weights from numpy arrays
-# Sets model weights from numpy arrays
 def set_weights(net: torch.nn.Module, parameters):
-    params_dict = zip(net.state_dict().keys(), parameters)
-    state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-    net.load_state_dict(state_dict, strict=True)
+    """Set model weights, with special handling for different model types"""
+    if is_sklearn_model(net):
+        # Sklearn models don't use traditional weight setting
+        return
+    
+    model_type = get_model_type(net)
+    if model_type == "ulcd":
+        # For ULCD, only update LoRA parameters
+        lora_keys = [k for k in net.state_dict().keys() if "lora" in k.lower()]
+        if len(parameters) == len(lora_keys):
+            # Update only LoRA parameters
+            params_dict = zip(lora_keys, parameters)
+            state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+            net.load_state_dict(state_dict, strict=False)
+        else:
+            # Fallback to full model update
+            params_dict = zip(net.state_dict().keys(), parameters)
+            state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+            net.load_state_dict(state_dict, strict=True)
+    else:
+        # Standard weight setting for other models
+        params_dict = zip(net.state_dict().keys(), parameters)
+        state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+        net.load_state_dict(state_dict, strict=True)
 
 # Extracts key lab values for given admissions
 def get_lab_features(hadm_ids: List[int], data_dir: str = "mimic-iv-3.1") -> pd.DataFrame:
@@ -1119,12 +1258,13 @@ def get_cache_path(feature_type: str, data_dir: str) -> str:
     return os.path.join(FEATURE_CACHE_DIR, f"{feature_type}_{data_hash}.pkl")
 
 # Loads cached features or computes them if not cached
-def load_or_compute_features(feature_type: str, compute_func, data_dir: str, force_recompute: bool = False):
+def load_or_compute_features(feature_type: str, compute_func, data_dir: str, force_recompute: bool = False, quiet_mode: bool = False):
     ensure_cache_dir()
     cache_path = get_cache_path(feature_type, data_dir)
     
     if os.path.exists(cache_path) and not force_recompute:
-        print(f"Loading cached {feature_type} features from {cache_path}")
+        if not quiet_mode:
+            print(f"Loading cached {feature_type} features from {cache_path}")
         try:
             with open(cache_path, 'rb') as f:
                 return pickle.load(f)
@@ -2545,13 +2685,13 @@ def _compute_fallback_secondary_diagnosis_features(all_hadm_ids: List[int]) -> p
     return pd.DataFrame.from_dict(secondary_features, orient='index')
 
 # Gets medical features for specific admissions from cache
-def get_medical_features_for_admissions(hadm_ids: List[int], data_dir: str = "mimic-iv-3.1", include_icd_features: bool = True) -> pd.DataFrame:
+def get_medical_features_for_admissions(hadm_ids: List[int], data_dir: str = "mimic-iv-3.1", include_icd_features: bool = True, quiet_mode: bool = False) -> pd.DataFrame:
     try:
         # Always include: Basic clinical data not derived from ICD codes
-        lab_features = load_or_compute_features("lab", None, data_dir)
-        med_features = load_or_compute_features("medication", None, data_dir)
-        icu_features = load_or_compute_features("icu_monitoring", None, data_dir)
-        micro_features = load_or_compute_features("microbiology", None, data_dir)
+        lab_features = load_or_compute_features("lab", None, data_dir, quiet_mode=quiet_mode)
+        med_features = load_or_compute_features("medication", None, data_dir, quiet_mode=quiet_mode)
+        icu_features = load_or_compute_features("icu_monitoring", None, data_dir, quiet_mode=quiet_mode)
+        micro_features = load_or_compute_features("microbiology", None, data_dir, quiet_mode=quiet_mode)
         
         all_features = []
         feature_types = [
@@ -2563,7 +2703,7 @@ def get_medical_features_for_admissions(hadm_ids: List[int], data_dir: str = "mi
         
         # Conditionally include: Administrative/severity features (only for training)
         if include_icd_features:
-            severity_features = load_or_compute_features("severity", None, data_dir)
+            severity_features = load_or_compute_features("severity", None, data_dir, quiet_mode=quiet_mode)
             
             feature_types.extend([
                 (severity_features, "severity", True),  # DRG codes, hospital services, ICU exposure
@@ -2579,17 +2719,20 @@ def get_medical_features_for_admissions(hadm_ids: List[int], data_dir: str = "mi
                 filtered = features.reindex(hadm_ids, fill_value=0)
                 all_features.append(filtered)
                 mode_str = "(administrative/severity)" if name == "severity" else "(basic clinical)"
-                print(f"Added {len(filtered.columns)} {name} features {mode_str}")
+                if not quiet_mode:
+                    print(f"Added {len(filtered.columns)} {name} features {mode_str}")
         
         if all_features:
             combined = pd.concat(all_features, axis=1)
-            print(f"Total medical features: {len(combined.columns)} ({'with' if include_icd_features else 'without'} administrative features)")
+            if not quiet_mode:
+                print(f"Total medical features: {len(combined.columns)} ({'with' if include_icd_features else 'without'} administrative features)")
             return combined
         else:
-            print("No medical features available")
+            if not quiet_mode:
+                print("No medical features available")
             return pd.DataFrame(index=hadm_ids)
             
     except Exception as e:
-        print(f"Error loading medical features: {e}")
+        print(f"Error loading medical features: {e}")  # Always show errors
         return pd.DataFrame(index=hadm_ids)
 

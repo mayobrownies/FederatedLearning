@@ -28,18 +28,21 @@ class FlowerClient(fl.client.NumPyClient):
                 partition_scheme=run_config.get("partitioning", "heterogeneous"),
                 top_k_codes=run_config.get("top_k_codes", 75),
                 cached_partitions=run_config.get("cached_partitions"),
-                precomputed_icd_data=run_config
+                precomputed_icd_data=run_config,
+                quiet_mode=run_config.get("quiet_mode", False)
             )
         else:
-            # Distributed mode: each client loads independently like old implementation
+            # Distributed mode: use global partitions
             self.trainloader, self.testloader, input_dim, output_dim = load_data(
                 partition_id=partition_id,
                 batch_size=run_config.get("batch_size", run_config.get("batch-size", 64)),
                 data_dir=run_config.get("data_dir", run_config.get("data-dir", "mimic-iv-3.1")),
                 min_partition_size=run_config.get("min_partition_size", run_config.get("min-partition-size", 1000)),
                 partition_scheme=run_config.get("partitioning", "heterogeneous"),
-                top_k_codes=run_config.get("top_k_codes", 75)
-                # No cached_partitions or precomputed_icd_data - load independently
+                top_k_codes=run_config.get("top_k_codes", 75),
+                cached_partitions=None,  # Will use GLOBAL_PARTITIONS
+                precomputed_icd_data=run_config,
+                quiet_mode=run_config.get("quiet_mode", False)
             )
         
         self.net = get_model(run_config.get("model_name", "advanced"), input_dim, output_dim=output_dim)
@@ -78,6 +81,12 @@ class FlowerClient(fl.client.NumPyClient):
         
         print(f"[CLIENT {self.partition_id}] Training completed - Loss: {train_loss:.4f}, Top-K ratio: {top_k_ratio:.2%}")
         
+        # Force garbage collection after training
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         return get_weights(self.net), len(self.trainloader.dataset), {
             "train_loss": train_loss,
             "top_k_ratio": top_k_ratio
@@ -89,7 +98,20 @@ class FlowerClient(fl.client.NumPyClient):
             print(f"[CLIENT {self.partition_id}] Starting evaluation...")
             set_weights(self.net, parameters)
             
+            # Force garbage collection before evaluation
+            import gc
+            gc.collect()
+            
+            # Clear GPU cache if using CUDA
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             loss, metrics = test(self.net, self.testloader, device=self.device)
+            
+            # Force cleanup after evaluation
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             print(f"[CLIENT {self.partition_id}] Evaluation completed - Loss: {loss:.4f}, Acc: {metrics.get('accuracy', 0):.3f}")
             
@@ -97,6 +119,12 @@ class FlowerClient(fl.client.NumPyClient):
         
         except Exception as e:
             print(f"Client {self.partition_id} evaluation failed: {e}")
+            
+            # Force cleanup on failure
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             return 0.0, len(self.testloader.dataset), {
                 "accuracy": 0.0, 
