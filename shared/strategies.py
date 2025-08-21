@@ -203,7 +203,16 @@ def test_global_model(parameters: Parameters, data_dir: str = "mimic-iv-3.1", pa
         X_test = test_features.values.astype(np.float32)
         y_test = test_labels.astype(np.int64)
         test_dataset = MimicDataset(torch.from_numpy(X_test), torch.from_numpy(y_test))
-        test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+        # Import performance settings
+        from .run import PIN_MEMORY, NUM_WORKERS
+        
+        test_loader = DataLoader(
+            test_dataset, 
+            batch_size=64, 
+            shuffle=False,
+            pin_memory=PIN_MEMORY if torch.cuda.is_available() else False,
+            num_workers=NUM_WORKERS if len(test_dataset) > 1000 else 0
+        )
         
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         model.to(device)
@@ -243,6 +252,11 @@ def test_global_model(parameters: Parameters, data_dir: str = "mimic-iv-3.1", pa
 # Gets federated learning strategy with aggregation functions
 def get_strategy(strategy_name: str, run_config=None, **kwargs):
     
+    # Check if this is a ULCD strategy request
+    if strategy_name == "ulcd":
+        from .ulcd_strategy import get_ulcd_strategy
+        return get_ulcd_strategy(run_config=run_config, **kwargs)
+    
     def evaluate_metrics_aggregation_fn(eval_metrics):
         try:
             print(f"Evaluate metrics aggregation called with {len(eval_metrics)} results")
@@ -275,6 +289,7 @@ def get_strategy(strategy_name: str, run_config=None, **kwargs):
     additional_kwargs = {k: v for k, v in kwargs.items() if k not in strategy_kwargs}
     strategy_kwargs.update(additional_kwargs)
     
+    # Use standard strategies
     if strategy_name == "fedavg":
         # FedAvg doesn't use proximal_mu, so remove it from kwargs
         fedavg_kwargs = {k: v for k, v in strategy_kwargs.items() if k != 'proximal_mu'}

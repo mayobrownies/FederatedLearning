@@ -91,7 +91,7 @@ class ULCDNet(nn.Module):
             d_model=latent_dim,
             num_heads=min(4, latent_dim // 16),  # Adaptive heads based on latent dim
             num_layers=2,
-            use_lora=True
+            use_lora=False  # TODO: Re-enable LoRA after FL issues resolved
         )
         
         # Consensus mechanism for latent space alignment
@@ -490,6 +490,11 @@ def get_model(model_name: str, input_dim: int, output_dim: int, **kwargs):
     elif model_name == "ulcd":
         latent_dim = kwargs.get('latent_dim', 64)
         return ULCDNet(input_dim, output_dim, latent_dim=latent_dim)
+    elif model_name == "ulcd_multimodal":
+        from .ulcd_components import MultimodalULCDClient
+        latent_dim = kwargs.get('latent_dim', 64)
+        tabular_dim = kwargs.get('tabular_dim', input_dim)
+        return MultimodalULCDClient(tabular_dim=tabular_dim, latent_dim=latent_dim, task_out=output_dim)
     elif model_name == "lstm":
         hidden_dim = kwargs.get('hidden_dim', 128)
         num_layers = kwargs.get('num_layers', 2)
@@ -518,7 +523,11 @@ def is_sklearn_model(model):
 
 def get_model_type(model):
     """Get the type of model for special handling"""
-    if isinstance(model, ULCDNet):
+    # Check for multimodal ULCD first (more specific)
+    from .ulcd_components import MultimodalULCDClient
+    if isinstance(model, MultimodalULCDClient):
+        return "ulcd_multimodal"
+    elif isinstance(model, ULCDNet):
         return "ulcd"
     elif isinstance(model, LSTMNet):
         return "lstm"

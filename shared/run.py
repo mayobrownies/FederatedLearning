@@ -31,14 +31,14 @@ MIMIC_DATA_DIR = "mimic-iv-3.1"
 MIN_PARTITION_SIZE = 1000
 
 # Model and training configuration
-NUM_ROUNDS = 3 
+NUM_ROUNDS = 3
 LOCAL_EPOCHS = 5
-BATCH_SIZE = 32
-MAX_CLIENTS = 1000
+BATCH_SIZE = 1024
+MAX_CLIENTS = 100
 LEARNING_RATE = 0.001
 
-# Choose FL strategy: ["fedavg", "fedprox"]
-AVAILABLE_STRATEGIES = ["fedavg", "fedprox"]
+# Choose FL strategy: ["fedavg", "fedprox", "ulcd"]
+AVAILABLE_STRATEGIES = ["fedavg", "fedprox", "ulcd"]
 FL_STRATEGY = AVAILABLE_STRATEGIES[0]
 
 # Choose partitioning scheme: ["heterogeneous", "balanced"]
@@ -46,13 +46,18 @@ AVAILABLE_PARTITIONING = ["heterogeneous", "balanced"]
 PARTITIONING_SCHEME = AVAILABLE_PARTITIONING[0]
 
 # Choose execution mode: [True, False]
-USE_LOCAL_MODE = False
+USE_LOCAL_MODE = True
 
 # Reduce verbose logging for local mode
 QUIET_MODE = True
 
-# Models to test
-MODELS_TO_TEST = ["ulcd", "lstm", "moe", "mlp", "logistic"]
+# Models to test - add ulcd_multimodal for true ULCD comparison
+MODELS_TO_TEST = {"ulcd", "ulcd_multimodal", "logistic"}
+#MODELS_TO_TEST = ["ulcd", "ulcd_multimodal", "lstm", "moe", "mlp", "logistic"]
+
+# Strategies to compare (set to None to use single strategy mode)
+STRATEGIES_TO_COMPARE = ["fedavg", "ulcd"]  # Set to None to use only FL_STRATEGY
+# STRATEGIES_TO_COMPARE = None  # Uncomment to use single strategy mode
 
 # FedProx configuration (only used when FL_STRATEGY = "fedprox")
 PROXIMAL_MU = 0.1  # Set > 0 for fedprox; = 0 for fedavg
@@ -65,9 +70,19 @@ USE_FOCAL_LOSS = False
 HIDDEN_DIMS = [512, 256, 128]
 DROPOUT_RATE = 0.3
 
+# Performance optimizations for local mode
+ENABLE_GPU_OPTIMIZATIONS = True
+PIN_MEMORY = True
+NUM_WORKERS = 4  # DataLoader workers
+
+# Suppress transformer warnings
+import warnings
+warnings.filterwarnings("ignore", "enable_nested_tensor is True", UserWarning)
+
 # Model-specific parameters
 MODEL_PARAMS = {
     "ulcd": {"latent_dim": 64}, 
+    "ulcd_multimodal": {"latent_dim": 64, "tabular_dim": 20},  # True ULCD with multimodal support
     "lstm": {"hidden_dim": 128, "num_layers": 2},
     "moe": {"num_experts": 4, "expert_dim": 128}, 
     "mlp": {"hidden_dims": [512, 256, 128]}, 
@@ -226,9 +241,11 @@ def run_federated_learning_for_model(model_name, partitions, run_config_base):
         partition_id = int(context.node_id) % NUM_CLIENTS
         return get_client(run_config=run_config, partition_id=partition_id).to_client()
 
-    strategy = get_strategy(FL_STRATEGY, run_config=run_config, proximal_mu=run_config["proximal_mu"])
+    # Get strategy from run_config (allows dynamic strategy switching)
+    current_strategy = run_config.get("strategy", FL_STRATEGY)
+    strategy = get_strategy(current_strategy, run_config=run_config, proximal_mu=run_config["proximal_mu"])
 
-    print(f"Starting {FL_STRATEGY.upper()} simulation with {NUM_CLIENTS} clients for {NUM_ROUNDS} rounds...")
+    print(f"Starting {current_strategy.upper()} simulation with {NUM_CLIENTS} clients for {NUM_ROUNDS} rounds...")
     
     # Configure simulation parameters
     simulation_args = {
@@ -247,13 +264,12 @@ def run_federated_learning_for_model(model_name, partitions, run_config_base):
         }
     }
     
+    
     if not USE_LOCAL_MODE:
-        # Local mode: can use more generous memory allocation
-        if USE_LOCAL_MODE:
-            simulation_args["client_resources"] = {"num_cpus": 0.5, "memory": 1000000000}  # 1GB per client for local mode
-        else:
-            simulation_args["client_resources"] = {"num_cpus": 0.2, "memory": 256000000}  # Minimal resources for distributed
-        # Extremely conservative server configuration to prevent crashes
+        # Distributed mode resource allocation
+        simulation_args["client_resources"] = {"num_cpus": 0.2, "memory": 256000000}  # Minimal resources for distributed
+        
+        # Conservative server configuration to prevent crashes
         simulation_args["config"].fit_metrics_aggregation_fn = None
         simulation_args["config"].evaluate_metrics_aggregation_fn = None
         simulation_args["config"].fraction_fit = min(1.0, 3 / max(NUM_CLIENTS, 3))  # Only 3 clients max
@@ -261,6 +277,9 @@ def run_federated_learning_for_model(model_name, partitions, run_config_base):
         simulation_args["config"].min_fit_clients = min(2, NUM_CLIENTS)
         simulation_args["config"].min_evaluate_clients = min(2, NUM_CLIENTS)
         simulation_args["config"].min_available_clients = min(2, NUM_CLIENTS)
+    else:
+        # Local mode: can use more generous memory allocation
+        simulation_args["client_resources"] = {"num_cpus": 0.5, "memory": 1000000000}  # 1GB per client for local mode
     
     # Run simulation with robust error handling
     try:
@@ -327,8 +346,10 @@ def run_federated_learning_for_model(model_name, partitions, run_config_base):
     model_type = get_model_type(dummy_model)
     
     if model_type == "ulcd":
-        # ULCD only sends LoRA parameters
-        results["comm_payload_mb"] = 0.5  # Much smaller payload
+        # TODO: Re-enable LoRA communication efficiency after FL issues resolved
+        # ULCD currently sends full parameters (LoRA disabled)
+        total_params = sum(p.numel() for p in dummy_model.parameters())
+        results["comm_payload_mb"] = (total_params * 4) / (1024 * 1024)  # 4 bytes per float32
     elif model_type == "sklearn":
         # Sklearn models don't send traditional parameters
         results["comm_payload_mb"] = 0.1
@@ -382,11 +403,14 @@ def create_comparison_tables(all_results):
     
     for result in all_results:
         model = result["model_name"]
+        strategy = result.get("strategy", "unknown")
+        experiment_id = f"{strategy}_{model}" if "strategy" in result else model
+        
         accuracy = result["accuracy"] * 100
         top5 = min(accuracy * 2.0, 100)   # Simulated top-5 (higher than top-1)
         top25 = min(accuracy * 3.5, 100)  # Simulated top-25 
         top100 = min(accuracy * 5.2, 100) # Simulated top-100 (much higher)
-        row = f"{model.title():<15} {top5:<12.1f} {top25:<12.1f} {top100:<12.1f}"
+        row = f"{experiment_id:<15} {top5:<12.1f} {top25:<12.1f} {top100:<12.1f}"
         print(row)
         table_content.append(row)
     print(table1_sep)
@@ -731,45 +755,72 @@ def main():
     
     ray.init(**ray_init_args)
     
-    # Run federated learning for all models
+    # Determine which strategies to run
+    strategies_to_run = STRATEGIES_TO_COMPARE if STRATEGIES_TO_COMPARE else [FL_STRATEGY]
+    
+    # Run federated learning for all strategy-model combinations
     all_results = []
-    for i, model_name in enumerate(MODELS_TO_TEST):
-        try:
-            print(f"\n[{i+1}/{len(MODELS_TO_TEST)}] Training {model_name.upper()}...")
-            
-            # Force aggressive memory cleanup before each model
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # Don't restart Ray to preserve global variables
-            results = run_federated_learning_for_model(model_name, VALID_PARTITIONS, run_config_base)
-            all_results.append(results)
-            
-            # Force aggressive garbage collection between models
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # Add a small delay to allow memory cleanup
-            import time
-            time.sleep(2)
-            
-        except Exception as e:
-            print(f"Error training {model_name}: {e}")
-            # Add dummy results for failed models
-            all_results.append({
-                "model_name": model_name,
-                "accuracy": 0.0,
-                "f1": 0.0,
-                "precision": 0.0,
-                "recall": 0.0,
-                "training_time": 0.0,
-                "final_loss": 999.0,
-                "comm_payload_mb": 0.0,
-                "comm_efficiency": 0.0
-            })
+    total_experiments = len(strategies_to_run) * len(MODELS_TO_TEST)
+    experiment_count = 0
+    
+    for strategy_name in strategies_to_run:
+        print(f"\n" + "="*80)
+        print(f"TESTING STRATEGY: {strategy_name.upper()}")
+        print("="*80)
+        
+        # Update run config for this strategy
+        current_run_config = run_config_base.copy()
+        current_run_config["strategy"] = strategy_name
+        
+        for model_name in MODELS_TO_TEST:
+            experiment_count += 1
+            try:
+                print(f"\n[{experiment_count}/{total_experiments}] Strategy: {strategy_name.upper()} | Model: {model_name.upper()}")
+                
+                # Skip incompatible combinations
+                if strategy_name == "ulcd" and model_name not in ["ulcd_multimodal"]:
+                    print(f"   [SKIP] {model_name} not compatible with ULCD strategy (needs ulcd_multimodal)")
+                    continue
+                
+                # Force aggressive memory cleanup before each model
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # Don't restart Ray to preserve global variables
+                results = run_federated_learning_for_model(model_name, VALID_PARTITIONS, current_run_config)
+                
+                # Add strategy info to results
+                results["strategy"] = strategy_name
+                results["experiment_id"] = f"{strategy_name}_{model_name}"
+                all_results.append(results)
+                
+                # Force aggressive garbage collection between models
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # Add a small delay to allow memory cleanup
+                import time
+                time.sleep(2)
+                
+            except Exception as e:
+                print(f"Error training {model_name} with {strategy_name}: {e}")
+                # Add dummy results for failed models
+                all_results.append({
+                    "model_name": model_name,
+                    "strategy": strategy_name,
+                    "experiment_id": f"{strategy_name}_{model_name}",
+                    "accuracy": 0.0,
+                    "f1": 0.0,
+                    "precision": 0.0,
+                    "recall": 0.0,
+                    "training_time": 0.0,
+                    "final_loss": 999.0,
+                    "comm_payload_mb": 0.0,
+                    "comm_efficiency": 0.0
+                })
     
     # Generate comprehensive comparison
     create_comparison_tables(all_results)
@@ -777,8 +828,15 @@ def main():
     plot_training_progression(all_results)
     
     print("\n" + "="*80)
-    print(f"COMPREHENSIVE EXPERIMENT COMPLETED: {FL_STRATEGY.upper()} with {PARTITIONING_SCHEME} partitioning")
-    print(f"Tested {len(MODELS_TO_TEST)} models: {', '.join(MODELS_TO_TEST)}")
+    if STRATEGIES_TO_COMPARE:
+        print(f"COMPREHENSIVE STRATEGY COMPARISON COMPLETED")
+        print(f"Strategies tested: {', '.join(strategies_to_run)}")
+        print(f"Models tested: {', '.join(MODELS_TO_TEST)}")
+        print(f"Total experiments: {len(all_results)}")
+    else:
+        print(f"COMPREHENSIVE EXPERIMENT COMPLETED: {FL_STRATEGY.upper()} with {PARTITIONING_SCHEME} partitioning")
+        print(f"Tested {len(MODELS_TO_TEST)} models: {', '.join(MODELS_TO_TEST)}")
+    print(f"Partitioning scheme: {PARTITIONING_SCHEME}")
     print("="*80)
     
     # Cleanup Ray

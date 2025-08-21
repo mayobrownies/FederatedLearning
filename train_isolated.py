@@ -1816,8 +1816,23 @@ def evaluate_on_global_dataset(partitions, global_feature_space, icd_frequency_t
     train_dataset = MimicDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
     test_dataset = MimicDataset(torch.from_numpy(X_test), torch.from_numpy(y_test))
 
-    trainloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    testloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    # Import performance settings
+    from shared.run import PIN_MEMORY, NUM_WORKERS
+    
+    trainloader = DataLoader(
+        train_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=True,
+        pin_memory=PIN_MEMORY if torch.cuda.is_available() else False,
+        num_workers=NUM_WORKERS if len(train_dataset) > 1000 else 0
+    )
+    testloader = DataLoader(
+        test_dataset, 
+        batch_size=BATCH_SIZE, 
+        shuffle=False,
+        pin_memory=PIN_MEMORY if torch.cuda.is_available() else False,
+        num_workers=NUM_WORKERS if len(test_dataset) > 1000 else 0
+    )
     
     input_dim = X_train.shape[1]
     # Use actual number of unique classes (consistent with main training logic)
@@ -2263,8 +2278,23 @@ def main():
         train_dataset = MimicDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
         test_dataset = MimicDataset(torch.from_numpy(X_test), torch.from_numpy(y_test))
 
-        trainloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-        testloader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+        # Import performance settings
+        from shared.run import PIN_MEMORY, NUM_WORKERS
+        
+        trainloader = DataLoader(
+            train_dataset, 
+            batch_size=BATCH_SIZE, 
+            shuffle=True,
+            pin_memory=PIN_MEMORY if torch.cuda.is_available() else False,
+            num_workers=NUM_WORKERS if len(train_dataset) > 1000 else 0
+        )
+        testloader = DataLoader(
+            test_dataset, 
+            batch_size=BATCH_SIZE, 
+            shuffle=False,
+            pin_memory=PIN_MEMORY if torch.cuda.is_available() else False,
+            num_workers=NUM_WORKERS if len(test_dataset) > 1000 else 0
+        )
         
         input_dim = X_train.shape[1]
         

@@ -483,8 +483,34 @@ def load_data(partition_id: int, batch_size: int, data_dir: str = "mimic-iv-3.1"
         train_dataset = MimicDataset(X_train, y_train)
         eval_dataset = MimicDataset(X_eval, y_eval)
         
-        trainloader = DataLoader(train_dataset, batch_size=min(batch_size, len(train_dataset)), shuffle=True)
-        testloader = DataLoader(eval_dataset, batch_size=min(batch_size, len(eval_dataset)), shuffle=False)
+        # Import performance settings
+        from .run import PIN_MEMORY, NUM_WORKERS
+        
+        # Reduce workers in Ray environments to avoid process conflicts
+        import os
+        import sys
+        in_ray_environment = (
+            os.environ.get('RAY_ADDRESS') is not None or
+            'simulation' in str(os.getcwd()).lower() or
+            any('ray' in module for module in sys.modules.keys()) or
+            os.environ.get('RAY_HEAD_SERVICE_HOST') is not None
+        )
+        effective_workers = 0 if in_ray_environment else (NUM_WORKERS if len(train_dataset) > 1000 else 0)
+        
+        trainloader = DataLoader(
+            train_dataset, 
+            batch_size=min(batch_size, len(train_dataset)), 
+            shuffle=True,
+            pin_memory=PIN_MEMORY if torch.cuda.is_available() else False,
+            num_workers=effective_workers
+        )
+        testloader = DataLoader(
+            eval_dataset, 
+            batch_size=min(batch_size, len(eval_dataset)), 
+            shuffle=False,
+            pin_memory=PIN_MEMORY if torch.cuda.is_available() else False,
+            num_workers=0 if in_ray_environment else (NUM_WORKERS if len(eval_dataset) > 1000 else 0)
+        )
         
         input_dim = X_train.shape[1]
         output_dim = top_k_codes + 1  # +1 for "other" class
@@ -523,8 +549,32 @@ def create_partition_dataloaders(data, mlb, all_feature_cols, partition_id, part
     train_dataset = MimicDataset(X_train_values, y_train)
     test_dataset = MimicDataset(X_test_values, y_test)
 
-    trainloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    testloader = DataLoader(test_dataset, batch_size=batch_size)
+    # Import performance settings
+    from .run import PIN_MEMORY, NUM_WORKERS
+    
+    # Reduce workers in Ray environments to avoid process conflicts
+    import os
+    import sys
+    in_ray_environment = (
+        os.environ.get('RAY_ADDRESS') is not None or
+        'simulation' in str(os.getcwd()).lower() or
+        any('ray' in module for module in sys.modules.keys()) or
+        os.environ.get('RAY_HEAD_SERVICE_HOST') is not None
+    )
+    
+    trainloader = DataLoader(
+        train_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        pin_memory=PIN_MEMORY if torch.cuda.is_available() else False,
+        num_workers=0 if in_ray_environment else (NUM_WORKERS if len(train_dataset) > 1000 else 0)
+    )
+    testloader = DataLoader(
+        test_dataset, 
+        batch_size=batch_size,
+        pin_memory=PIN_MEMORY if torch.cuda.is_available() else False,
+        num_workers=0 if in_ray_environment else (NUM_WORKERS if len(test_dataset) > 1000 else 0)
+    )
     
     return trainloader, testloader, len(all_feature_cols), len(mlb.classes_)
 
@@ -542,6 +592,34 @@ def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, devi
     # Handle sklearn models differently
     if is_sklearn_model(net):
         return train_sklearn_model(net, trainloader)
+    
+    # Apply GPU optimizations (Ray-safe approach)
+    from .run import ENABLE_GPU_OPTIMIZATIONS
+    if ENABLE_GPU_OPTIMIZATIONS and torch.cuda.is_available():
+        try:
+            # Enable cuDNN benchmarking for consistent input sizes
+            torch.backends.cudnn.benchmark = True
+            
+            # Disable torch.compile completely in Ray environments (even local_mode)
+            # torch.compile has issues with Ray's process management
+            import os
+            import sys
+            in_ray_environment = (
+                os.environ.get('RAY_ADDRESS') is not None or 
+                'ray' in str(type(torch.cuda.current_device)) or
+                'simulation' in str(os.getcwd()).lower() or
+                any('ray' in module for module in sys.modules.keys()) or
+                os.environ.get('RAY_HEAD_SERVICE_HOST') is not None
+            )
+            
+            if not in_ray_environment and hasattr(torch, 'compile'):
+                net = torch.compile(net, mode='default')
+                print("[INFO] torch.compile enabled (non-Ray environment)")
+            else:
+                print("[INFO] torch.compile disabled (Ray environment detected)")
+        except Exception as e:
+            print(f"[WARNING] GPU optimization failed: {e}")
+            # Continue without optimizations
     
     # Calculate class weights from this client's data
     all_labels = []
@@ -578,6 +656,37 @@ def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, devi
     global_net.to(device)
     net.train()
     
+    # Initialize mixed precision scaler if GPU optimizations enabled
+    scaler = None
+    if ENABLE_GPU_OPTIMIZATIONS and torch.cuda.is_available():
+        try:
+            # Disable mixed precision in Ray environments due to compatibility issues
+            import os
+            import sys
+            in_ray_environment = (
+                os.environ.get('RAY_ADDRESS') is not None or 
+                'ray' in str(type(torch.cuda.current_device)) or
+                'simulation' in str(os.getcwd()).lower() or
+                any('ray' in module for module in sys.modules.keys()) or
+                os.environ.get('RAY_HEAD_SERVICE_HOST') is not None
+            )
+            
+            if not in_ray_environment:
+                # Try new PyTorch API first (PyTorch 2.1+)
+                try:
+                    from torch.amp import GradScaler
+                    scaler = GradScaler('cuda')
+                    print("[INFO] Mixed precision enabled (non-Ray environment)")
+                except ImportError:
+                    # Fall back to older API
+                    from torch.cuda.amp import GradScaler
+                    scaler = GradScaler()
+                    print("[INFO] Mixed precision enabled (non-Ray environment, legacy API)")
+            else:
+                print("[INFO] Mixed precision disabled (Ray environment detected)")
+        except ImportError:
+            pass  # Mixed precision not available
+    
     total_loss = 0
     num_batches = 0
     
@@ -589,21 +698,54 @@ def train(net, global_net, trainloader, epochs, learning_rate, proximal_mu, devi
             features, labels = features.to(device), labels.to(device)
             optimizer.zero_grad()
             
-            outputs = net(features)
-            loss = criterion(outputs, labels)
-            
-            # FedProx regularization term
-            proximal_term = 0.0
-            for w, w_t in zip(net.parameters(), global_net.parameters()):
-                proximal_term += (w - w_t).norm(2)
-            
-            total_loss_with_reg = loss + (proximal_mu / 2) * proximal_term
-            total_loss_with_reg.backward()
-            
-            # Gradient clipping for stability
-            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
-            
-            optimizer.step()
+            # Use mixed precision if available
+            if scaler is not None:
+                # Try new PyTorch API first (PyTorch 2.1+)
+                try:
+                    from torch.amp import autocast
+                    autocast_context = autocast('cuda')
+                except ImportError:
+                    # Fall back to older API
+                    from torch.cuda.amp import autocast
+                    autocast_context = autocast()
+                
+                with autocast_context:
+                    outputs = net(features)
+                    loss = criterion(outputs, labels)
+                    
+                    # FedProx regularization term
+                    proximal_term = 0.0
+                    for w, w_t in zip(net.parameters(), global_net.parameters()):
+                        proximal_term += (w - w_t).norm(2)
+                    
+                    total_loss_with_reg = loss + (proximal_mu / 2) * proximal_term
+                
+                # Scale gradients and backward pass
+                scaler.scale(total_loss_with_reg).backward()
+                
+                # Gradient clipping for stability
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+                
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Standard precision training
+                outputs = net(features)
+                loss = criterion(outputs, labels)
+                
+                # FedProx regularization term
+                proximal_term = 0.0
+                for w, w_t in zip(net.parameters(), global_net.parameters()):
+                    proximal_term += (w - w_t).norm(2)
+                
+                total_loss_with_reg = loss + (proximal_mu / 2) * proximal_term
+                total_loss_with_reg.backward()
+                
+                # Gradient clipping for stability
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+                
+                optimizer.step()
             
             total_loss += loss.item()
             epoch_loss += loss.item()
@@ -842,21 +984,25 @@ def get_weights(net: torch.nn.Module):
         return [np.array([0.0])]
     
     model_type = get_model_type(net)
-    if model_type == "ulcd":
-        # For ULCD, only return LoRA parameters for FL communication efficiency
-        lora_params = {
-            k: v.cpu().numpy()
-            for k, v in net.state_dict().items()
-            if "lora" in k.lower()
-        }
-        if lora_params:
-            return list(lora_params.values())
-        else:
-            # Fallback to full model if no LoRA params found
-            return [val.cpu().numpy() for _, val in net.state_dict().items()]
-    else:
-        # Standard neural networks - return all parameters
-        return [val.cpu().numpy() for _, val in net.state_dict().items()]
+    # TODO: Re-enable ULCD LoRA communication efficiency after FL issues resolved
+    # if model_type == "ulcd":
+    #     # For ULCD, only return LoRA parameters for FL communication efficiency
+    #     lora_params = {
+    #         k: v.cpu().numpy()
+    #         for k, v in net.state_dict().items()
+    #         if "lora" in k.lower()
+    #     }
+    #     if lora_params:
+    #         return list(lora_params.values())
+    #     else:
+    #         # Fallback to full model if no LoRA params found
+    #         return [val.cpu().numpy() for _, val in net.state_dict().items()]
+    # else:
+    #     # Standard neural networks - return all parameters
+    #     return [val.cpu().numpy() for _, val in net.state_dict().items()]
+    
+    # For now, return all parameters for all models (including ULCD)
+    return [val.cpu().numpy() for _, val in net.state_dict().items()]
 
 # Sets model weights from numpy arrays
 def set_weights(net: torch.nn.Module, parameters):
@@ -866,24 +1012,30 @@ def set_weights(net: torch.nn.Module, parameters):
         return
     
     model_type = get_model_type(net)
-    if model_type == "ulcd":
-        # For ULCD, only update LoRA parameters
-        lora_keys = [k for k in net.state_dict().keys() if "lora" in k.lower()]
-        if len(parameters) == len(lora_keys):
-            # Update only LoRA parameters
-            params_dict = zip(lora_keys, parameters)
-            state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-            net.load_state_dict(state_dict, strict=False)
-        else:
-            # Fallback to full model update
-            params_dict = zip(net.state_dict().keys(), parameters)
-            state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-            net.load_state_dict(state_dict, strict=True)
-    else:
-        # Standard weight setting for other models
-        params_dict = zip(net.state_dict().keys(), parameters)
-        state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-        net.load_state_dict(state_dict, strict=True)
+    # TODO: Re-enable ULCD LoRA communication efficiency after FL issues resolved
+    # if model_type == "ulcd":
+    #     # For ULCD, only update LoRA parameters
+    #     lora_keys = [k for k in net.state_dict().keys() if "lora" in k.lower()]
+    #     if len(parameters) == len(lora_keys):
+    #         # Update only LoRA parameters
+    #         params_dict = zip(lora_keys, parameters)
+    #         state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+    #         net.load_state_dict(state_dict, strict=False)
+    #     else:
+    #         # Fallback to full model update
+    #         params_dict = zip(net.state_dict().keys(), parameters)
+    #         state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+    #         net.load_state_dict(state_dict, strict=True)
+    # else:
+    #     # Standard weight setting for other models
+    #     params_dict = zip(net.state_dict().keys(), parameters)
+    #     state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+    #     net.load_state_dict(state_dict, strict=True)
+    
+    # For now, use standard weight setting for all models (including ULCD)
+    params_dict = zip(net.state_dict().keys(), parameters)
+    state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+    net.load_state_dict(state_dict, strict=True)
 
 # Extracts key lab values for given admissions
 def get_lab_features(hadm_ids: List[int], data_dir: str = "mimic-iv-3.1") -> pd.DataFrame:
